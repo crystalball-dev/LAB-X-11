@@ -8,6 +8,10 @@ Revision 2: reviewed by a three-lens panel (real-time/JUCE, vocal DSP, X-16 conf
 finding; the ten confirmed findings are folded in (dB-domain slew ramp, hold-counter order, hold minimum, RMS
 accumulator and window, meters owned by the chain, explicit latency rounding, M1 scope). Section 11 lists them.
 
+Revision 3 (implementation): the gate and the alignment are built (`core/dsp/Gate.h`, `core/dsp/Align.h`) on the real
+LAB X-16 base and reviewed again, code against this spec. Where the build differs from revisions 1-2, section 12 says
+what changed and why, and the affected rows below are corrected; section 12 wins over anything older in this file.
+
 Scope: the two real-time modules that sit under guard stage `gate` in the X-11 chain:
 
 1. `lab::dsp::VocalGate` — the lookahead noise gate (detector, hysteresis state machine, gain ramps, range).
@@ -143,7 +147,7 @@ path, `(float)` casts, `std::` numerics, no member prefixes.
 | `rmsWindow` | running mean of squares, fixed window | Window length fixed per sample rate (PROPOSED **2.5 ms**, half the lookahead, so RMS mode still pre-opens); ring sized in `prepare()`; the running sum is kept in **double** and clamped: `level = sqrt (max (sum, 0.0) / windowLen) + 1e-9`, so float drift can never produce a negative sum and a NaN key |
 | `keyDb` | float | `20 log10 (max (level, 1e-6))`, i.e. floored at -120 dB; one log per sample (acceptable at C8's 20x real-time budget; a 16-sample decimation is the fallback, O3) |
 | `state` | enum Closed, Attack, Open, Hold, Release | Section 4.5 |
-| `holdCounter` | int samples | Set to `holdSamples` on entering Hold; tested **before** it is decremented (4.5) |
+| `holdCounter` | int samples | Set to `holdSamples + lookahead` on entering Hold from Open (`lookahead` alone after a false start); decremented first, released at `<= 0` (4.5, 12) |
 | `gain` | float, current linear gain | Moved every sample by a constant dB-per-sample slew (one multiply) and clamped to `[rangeGain, 1]`; see 4.5 |
 | `upStep`, `downStep` | float | `pow (10, (range / attackSamples) / 20)` and `pow (10, -(range / releaseSamples) / 20)`, recomputed once per control block; `range = 0` gives both steps 1 |
 | `rangeGain` | float | `dbToGain (-range)`; the closed floor; `range = 0` means the gate is transparent (preset 7 "Level Only") |
@@ -155,10 +159,10 @@ Common `mix`, `output`, `bypass` come first per the base (1.4). The gate's rows 
 
 | id | name | kind | min | max | default | skewCentre | smooth | unit | notes |
 |---|---|---|---|---|---|---|---|---|---|
-| `gate_thr` | Threshold | real | -80 | 0 | **-40 PROPOSED** | -30 | linear | dB | D6: measured floor + margin, never above breath level; -40 is the DD Gate reading |
+| `gate_thr` | Threshold | real | -80 | 0 | **-40 PROPOSED** | 0 | linear | dB | D6: measured floor + margin, never above breath level; -40 is the DD Gate reading |
 | `gate_hyst` | Hysteresis | real | 0 | 12 | **4 PROPOSED** | 0 | linear | dB | close threshold = thr - hyst |
 | `gate_attack` | Attack | real | 0.1 | 50 | **1 PROPOSED** | 5 | log | ms | time for the full traverse rangeGain -> 1 (exact, 4.5); attacks <= lookahead are fully pre-empted in Peak mode |
-| `gate_hold` | Hold | real | **1** | 500 | **40 PROPOSED** | 50 | log | ms | min 1 ms, not 0: the base's log smoother cannot take log (0); 1 ms is inaudible as a hold. DD Gate hold 0-0.155 of range in the reference chains |
+| `gate_hold` | Hold | real | **0** | 500 | **40 PROPOSED** | 50 | log | ms | min 0 like DD Gate (0.00 in two reference chains): the base's log smoother clamps at 1e-4 (`Params.h`), so log (0) never occurs (revision 3 reverts R2) |
 | `gate_release` | Release | real | 5 | 2000 | **120 PROPOSED** | 200 | log | ms | time for the full traverse 1 -> rangeGain (exact, 4.5); release near minimum in the reference chains, but tails must survive |
 | `gate_range` | Range | real | 0 | 80 | **24 PROPOSED** | 24 | linear | dB | attenuation when closed; 0 = open |
 | `det_lowcut` | Low Cut | real | 20 | 500 | **80 PROPOSED** | 100 | log | Hz | 20 = off; keeps rumble and plosive energy out of the detector |
@@ -193,7 +197,8 @@ The base hands `control()` all rows; the gate converts ms to samples and dB to l
   above the current gain it rises at `upStep`), Attack / Open / Hold rise at `upStep`, Release falls at `downStep`.
 - **Closed:** target `rangeGain`; move to Attack when `keyDb > openThr`.
 - **Attack:** rise; on `keyDb < closeThr` go to Release (a false start never gets a hold); when `gain == 1` go to Open.
-- **Open:** gain stays 1; on `keyDb < closeThr` go to Hold and set `holdCounter = holdSamples`.
+- **Open:** gain stays 1; on `keyDb < closeThr` go to Hold and set `holdCounter = holdSamples + lookahead` (revision 3:
+  the key runs ahead of the audio, so the hold is counted in output time).
 - **Hold:** gain stays 1. Sample-exact order, tested before decrementing:
   `if (keyDb > openThr) state = Open; else if (holdCounter <= 0) state = Release; else --holdCounter;`
   so Release starts exactly `holdSamples` samples after the key dropped below `closeThr`, and a hold of 1 ms (the
@@ -430,7 +435,7 @@ every panel title of handoff 1.7, among them GATE // ШЛЮЗ and DETECTOR // Д
 | # | item | proposed here | handoff status | why it matters |
 |---|---|---|---|---|
 | O1 | File split | `Gate.h` + `Align.h` | tree names `Gate.h` only | testability of latency vs. one file fewer |
-| O2 | Detector key | mono sum 0.5 (L + R) | unspecified | max (|L|, |R|) is the alternative; vocals are mono so either works |
+| O2 | Detector key | **built:** low cut per channel, then max (|L|, |R|) (Peak) or the mean square of both (RMS) | unspecified | a mono sum can cancel on out-of-phase material; the louder channel cannot |
 | O3 | dB conversion rate | per sample | unspecified | per-16-sample decimation if C8 (20x real time) is tight |
 | O4 | Parameter ids | `gate_*`, `det_*` as in 4.4 | section 3 PENDING | append-only once installed (1.4) |
 | O5 | Ramp domain | constant dB-per-sample slew (one multiply + clamp), times exact | PENDING (DSP panel) | even in dB over the whole range; a linear one-pole was rejected by review (section 11) |
@@ -439,7 +444,7 @@ every panel title of handoff 1.7, among them GATE // ШЛЮЗ and DETECTOR // Д
 | O8 | Hysteresis default | 4 dB | PENDING (DSP panel) | too small chatters, too large delays close |
 | O9 | RMS window | 2.5 ms fixed (half the lookahead) | unspecified | keeps RMS mode pre-opening; fixed per sample rate so no run-time resize |
 | O10 | Lamp values | 1 open/attack, 0.5 hold/release, 0 closed | unspecified | purely visual |
-| O11 | Hold minimum | 1 ms (not 0) | handoff range unspecified | the base's log smoother cannot take 0; the alternative is `Smooth::linear` with min 0 |
+| O11 | Hold minimum | **built: 0 ms** | handoff range unspecified | the base's log smoother clamps at 1e-4, so 0 is safe and matches DD Gate |
 
 Everything else in sections 4-8 follows directly from the handoff text and needs no confirmation.
 
@@ -479,3 +484,28 @@ the handoff; each finding was then attacked by two refuters. Findings that both 
 Contested findings (one refuter each way), settled anyway because the fix was one line: the latency rule is now
 written as `(int) (sr * 0.005 + 0.5)` with the three resulting values (5.2, A1, T5), G7 composes the modules inside
 the test rather than calling `X11Chain`, and 8.2 says which signals `x11_tests.py` generates itself.
+
+---
+
+## 12. Implementation record (revision 3)
+
+Built on the real LAB X-16 base (`core/host/EffectProcessor.h`), which differs from what revisions 1-2 assumed in three
+places: the chain is called with at most 16 samples (`prepare (sr, controlBlock)`), guard stages are indices
+(`guard (0, ...)`, `guard (1, ...)`), and meters are written in the chain's `meter (Meters&)` hook after each host
+block, so the code sketch of section 6 is superseded by `plugins/x11/LabX11.cpp`. A second review (three lenses, two
+refuters per finding, every finding reproduced with the built harness or a compiled probe) found the defects below in
+the first build; all are fixed and each has a test that fails without the fix (a mutation run kills 16 of 16 mutants).
+
+| # | defect in the first build | change |
+|---|---|---|
+| I1 | **Preset click.** The base's preset fade-in (5 ms) equals the lookahead; `flush()` defaulted to `reset()`, which emptied the alignment ring, so the wet path was silent for the whole fade-in and stepped back in at full level (a 0.6 step on a -3 dBFS tone) | `X11Chain::flush()` keeps the ring and the gate state and resets only the matcher; `reset()` stays the full clear for faults and `prepareToPlay`. Section 5.3's "emptying the ring is inaudible" was wrong. Test T13 |
+| I2 | **Hold shortened by the lookahead.** The key runs 5 ms ahead of the audio, so Release started HOLD - 5 ms after the audio fell below close; HOLD 0-5 ms faded word tails early | Hold is entered with `holdSamples + lookahead`; a false start (the key falls below close during Attack) goes through Hold for the lookahead alone, so the audio that triggered it still passes; Hold returns to Attack, not Open, when the gain is not yet up. G3, G16 |
+| I3 | Ramp not sample-exact in float (one sample late at the defaults, up to 0.6 % on long, shallow releases) | the gain, floor and steps are kept in double and snapped within half a step of their end. G2 and G4 are exact at 44.1, 48 and 96 kHz |
+| I4 | A RANGE glide restarted on every `set()`, so with control blocks under 16 samples the floor never landed and RANGE 0 left the gate in Attack (no voice for the matcher) | the glide restarts only when RANGE changes. G9, G9b |
+| I5 | After `prepareToPlay` the floor started at the default 24 dB and glided to RANGE at the release rate | a `fresh` flag: the first `set()` after `reset()` places the floor directly. G8 |
+| I6 | LOW CUT switched back on reused stale filter state, which opened the gate on silence | the filters are cleared when LOW CUT turns on. G17b |
+| I7 | HOLD turned down during a hold waited out the old hold | `set()` shortens a running hold. G20 |
+| I8 | Self-tests left most of the state machine and the detector unchecked | G14 retrigger, G15 short dip, G16 false start, G17 low cut, G18 key calibration, G19 detector release, G20 hold change, G8c floor up, G9b small blocks; G7 now compares the delayed, gated audio sample by sample |
+
+Unchanged decisions confirmed by the build: 5 ms lookahead (221 / 240 / 480 samples), constant-dB slew, hysteresis
+4 dB, peak detector by default, 2.5 ms RMS window, the lamp's three values.
