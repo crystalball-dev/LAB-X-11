@@ -4,6 +4,10 @@ Status: **specification, no code.** Derived exclusively from `LAB_X11_HANDOFF.md
 handoff says PENDING, this document states a **PROPOSED** value and lists it in section 9 for confirmation against
 the "LAB X-11 vocal plugin plan" chat. No external audio, DLL or folder scan informed anything below.
 
+Revision 2: reviewed by a three-lens panel (real-time/JUCE, vocal DSP, X-16 conformance) with two refuters per
+finding; the ten confirmed findings are folded in (dB-domain slew ramp, hold-counter order, hold minimum, RMS
+accumulator and window, meters owned by the chain, explicit latency rounding, M1 scope). Section 11 lists them.
+
 Scope: the two real-time modules that sit under guard stage `gate` in the X-11 chain:
 
 1. `lab::dsp::VocalGate` — the lookahead noise gate (detector, hysteresis state machine, gain ramps, range).
@@ -75,10 +79,12 @@ in (L, R, n samples, undelayed)
   guard ("level", out)
 ```
 
-The detector therefore sees every sample LOOKAHEAD samples before the audio it governs. An attack ramp that starts when
-the key crosses the open threshold is complete by the time the onset reaches the output, provided
-`attackSamples <= LOOKAHEAD`; longer attacks still open "late" by `attack - LOOKAHEAD`, which is the ordinary
-non-lookahead behaviour and acceptable.
+The detector therefore sees every sample LOOKAHEAD samples before the audio it governs. With the slew ramp of 4.5 the
+attack is complete exactly `attackSamples` after the key crosses the open threshold, so the gate is fully open before
+the onset reaches the output whenever `attackSamples <= LOOKAHEAD`; longer attacks open "late" by
+`attack - LOOKAHEAD`, which is the ordinary non-lookahead behaviour and acceptable. This sample-exact guarantee
+holds for `det_mode = Peak`; in RMS mode the key rises over the window length first (4.3), so the pre-open margin is
+`LOOKAHEAD - windowSamples - attackSamples`.
 
 ---
 
@@ -99,9 +105,12 @@ namespace lab::dsp
 {
 struct VocalGate
 {
-    // Called from Chain::prepare. Sizes nothing but the detector state; the ring lives in TransientAlign.
-    void prepare (double sampleRate, int maxBlock) noexcept;
-    void reset() noexcept;                       // detector, state, gain -> closed, no click (gain starts at range)
+    // Called from Chain::prepare. Sizes the RMS ring; initialises every control-derived member (thresholds,
+    // slew steps, holdSamples, rangeGain, detector coefficients) from the 4.4 defaults so reset() and computeGain()
+    // are fully defined before the first control() (a fault reset on the first block must not read garbage).
+    void prepare (double sampleRate, int maxBlock);
+    void reset() noexcept;                       // keeps the last control() values; clears state, gain (-> rangeGain),
+                                                 // counters and followers; no click because the base fades around it
 
     // Called once per 16-sample control block with the base's smoothed values.
     // Index constants come from EffectInfo::params order (section 4.4).
@@ -114,8 +123,8 @@ struct VocalGate
     static int lookaheadSamples (double sampleRate) noexcept;
 
     bool  isOpen()        const noexcept;        // state == Open || Hold (for the matcher)
-    float gainReductionDb() const noexcept;      // for the needle, last control block
-    int   stateIndex()    const noexcept;        // 0 closed, 1 attack, 2 open, 3 hold, 4 release (lamp)
+    float gainReductionDb() const noexcept;      // plain float, updated once per control block (the chain publishes it)
+    int   stateIndex()    const noexcept;        // 0 closed, 1 attack, 2 open, 3 hold, 4 release (the chain maps to the lamp)
 
     static void selfTest();                      // section 8.1, prints selftest_<case>=<value>
 };
@@ -131,13 +140,14 @@ path, `(float)` casts, `std::` numerics, no member prefixes.
 |---|---|---|
 | `lowCut` | `Filters.h` SVF, high-pass, Q 0.707, 12 dB/oct | Cutoff from `det_lowcut`; coefficient recomputed in `control()` only; when cutoff <= 20 Hz the stage is bypassed (key passes untouched) |
 | `peakFollower` | `Follower.h` peak follower | Instant attack, release one-pole; coefficient `onePoleCoef (detRelease, sr)`; floor 1e-9 |
-| `rmsWindow` | running mean of squares, fixed window | Window length fixed per sample rate (PROPOSED 10 ms); ring sized in `prepare()`; square-root once per sample |
+| `rmsWindow` | running mean of squares, fixed window | Window length fixed per sample rate (PROPOSED **2.5 ms**, half the lookahead, so RMS mode still pre-opens); ring sized in `prepare()`; the running sum is kept in **double** and clamped: `level = sqrt (max (sum, 0.0) / windowLen) + 1e-9`, so float drift can never produce a negative sum and a NaN key |
 | `keyDb` | float | `20 log10 (max (level, 1e-6))`, i.e. floored at -120 dB; one log per sample (acceptable at C8's 20x real-time budget; a 16-sample decimation is the fallback, O3) |
 | `state` | enum Closed, Attack, Open, Hold, Release | Section 4.5 |
-| `holdCounter` | int samples | Loaded with `holdSamples` on entering Hold |
-| `gain` | float, current linear gain | Ramped every sample toward `target` with the state's coefficient |
+| `holdCounter` | int samples | Set to `holdSamples` on entering Hold; tested **before** it is decremented (4.5) |
+| `gain` | float, current linear gain | Moved every sample by a constant dB-per-sample slew (one multiply) and clamped to `[rangeGain, 1]`; see 4.5 |
+| `upStep`, `downStep` | float | `pow (10, (range / attackSamples) / 20)` and `pow (10, -(range / releaseSamples) / 20)`, recomputed once per control block; `range = 0` gives both steps 1 |
 | `rangeGain` | float | `dbToGain (-range)`; the closed floor; `range = 0` means the gate is transparent (preset 7 "Level Only") |
-| `meterOpen`, `meterGr` | `std::atomic<float>` | Stored with `memory_order_relaxed` once per control block |
+| `grDb`, `stateIdx` | plain float / int | Written once per control block; **no atomics in the DSP header**. The chain copies them into `Meters::custom` (6.2) |
 
 ### 4.4 Parameters (ParamSpec rows, gate and detector portion; ids are proposals, see O4)
 
@@ -147,9 +157,9 @@ Common `mix`, `output`, `bypass` come first per the base (1.4). The gate's rows 
 |---|---|---|---|---|---|---|---|---|---|
 | `gate_thr` | Threshold | real | -80 | 0 | **-40 PROPOSED** | -30 | linear | dB | D6: measured floor + margin, never above breath level; -40 is the DD Gate reading |
 | `gate_hyst` | Hysteresis | real | 0 | 12 | **4 PROPOSED** | 0 | linear | dB | close threshold = thr - hyst |
-| `gate_attack` | Attack | real | 0.1 | 50 | **1 PROPOSED** | 5 | log | ms | ramp time rangeGain -> 1; attacks <= lookahead are fully pre-empted |
-| `gate_hold` | Hold | real | 0 | 500 | **40 PROPOSED** | 50 | log | ms | DD Gate hold 0-0.155 of range in the reference chains |
-| `gate_release` | Release | real | 5 | 2000 | **120 PROPOSED** | 200 | log | ms | ramp time 1 -> rangeGain; release near minimum in the reference chains, but tails must survive |
+| `gate_attack` | Attack | real | 0.1 | 50 | **1 PROPOSED** | 5 | log | ms | time for the full traverse rangeGain -> 1 (exact, 4.5); attacks <= lookahead are fully pre-empted in Peak mode |
+| `gate_hold` | Hold | real | **1** | 500 | **40 PROPOSED** | 50 | log | ms | min 1 ms, not 0: the base's log smoother cannot take log (0); 1 ms is inaudible as a hold. DD Gate hold 0-0.155 of range in the reference chains |
+| `gate_release` | Release | real | 5 | 2000 | **120 PROPOSED** | 200 | log | ms | time for the full traverse 1 -> rangeGain (exact, 4.5); release near minimum in the reference chains, but tails must survive |
 | `gate_range` | Range | real | 0 | 80 | **24 PROPOSED** | 24 | linear | dB | attenuation when closed; 0 = open |
 | `det_lowcut` | Low Cut | real | 20 | 500 | **80 PROPOSED** | 100 | log | Hz | 20 = off; keeps rumble and plosive energy out of the detector |
 | `det_mode` | Detector | choice | — | — | **Peak PROPOSED** | — | none | — | `"Peak\|RMS"`; snaps at a block boundary, resets only the detector |
@@ -172,20 +182,26 @@ The base hands `control()` all rows; the gate converts ms to samples and dB to l
 ```
 
 - `openThr = gate_thr`, `closeThr = gate_thr - gate_hyst` (dB on the detector's key).
+- **Ramp law (all states):** the gain moves at a constant rate in dB, implemented as one multiply per sample and a
+  clamp: rising `gain = min (gain * upStep, 1)`, falling `gain = max (gain * downStep, rangeGain)`. `upStep` carries
+  `range / attackSamples` dB per sample, `downStep` carries `range / releaseSamples` dB per sample (4.3). So ATTACK
+  is the time for the full traverse floor -> 0 dB and RELEASE the time for 0 dB -> floor, exactly, at every sample rate.
+  A constant-dB slew is even over the whole range (a linear-domain one-pole would close fastest at the start and
+  crawl at the end, the opposite of what hides room tone), and "reached the target" is an equality after the clamp,
+  so no tolerance is needed. Each state has a direction and a step:
+  Closed falls at `downStep` (so a `gate_range` change while closed glides at the release rate; if the new floor is
+  above the current gain it rises at `upStep`), Attack / Open / Hold rise at `upStep`, Release falls at `downStep`.
 - **Closed:** target `rangeGain`; move to Attack when `keyDb > openThr`.
-- **Attack:** target 1, coefficient from `gate_attack`; on `keyDb < closeThr` go to Release (a false start never gets a
-  hold); on reaching 1 within 0.1 dB go to Open.
-- **Open:** target 1; on `keyDb < closeThr` go to Hold and load `holdCounter`.
-- **Hold:** target 1; `holdCounter--` each sample; `keyDb > openThr` returns to Open (counter cleared); counter zero
-  goes to Release.
-- **Release:** target `rangeGain`, coefficient from `gate_release`; `keyDb > openThr` goes to Attack (ramp continues
-  from the current gain, no jump); gain within 0.1 dB of `rangeGain` goes to Closed.
-- The ramp is a one-pole in the linear domain toward `target`, with time constant such that the 10 %-90 % transition
-  equals the parameter (`onePoleCoef` from `Common.h`, as the siblings do). Linear-domain ramps give the "closes fast
-  at the end" shape that hides room tone; a log-domain option is O5.
-- Changing `gate_range` while Closed or in Release re-targets without a state change (the base's 15 ms smoothing makes
-  this a slow glide).
-- `reset()` sets state Closed, `gain = rangeGain`, clears followers and counters.
+- **Attack:** rise; on `keyDb < closeThr` go to Release (a false start never gets a hold); when `gain == 1` go to Open.
+- **Open:** gain stays 1; on `keyDb < closeThr` go to Hold and set `holdCounter = holdSamples`.
+- **Hold:** gain stays 1. Sample-exact order, tested before decrementing:
+  `if (keyDb > openThr) state = Open; else if (holdCounter <= 0) state = Release; else --holdCounter;`
+  so Release starts exactly `holdSamples` samples after the key dropped below `closeThr`, and a hold of 1 ms (the
+  minimum) releases after 1 ms. `<= 0`, never `== 0`, so the counter can never run away.
+- **Release:** fall; `keyDb > openThr` goes to Attack (the rise continues from the current gain, no jump); when
+  `gain == rangeGain` go to Closed.
+- `reset()` sets state Closed, `gain = rangeGain`, clears followers and counters; it keeps the last `control()` values,
+  which `prepare()` has already initialised from the defaults (4.2).
 
 Timing is specified in samples computed from the sample rate at `prepare()`/`control()`, so the same preset times
 behave identically at 44.1, 48 and 96 kHz (T0 cases, section 8.1).
@@ -196,18 +212,18 @@ behave identically at 44.1, 48 and 96 kHz (T0 cases, section 8.1).
 for i in 0..n-1:
     key   = 0.5f * (keyL[i] + keyR[i])
     key   = lowCut.process (key)                     // skipped when bypassed
-    level = mode == Peak ? peakFollower.process (|key|) : rmsWindow.process (key*key)
+    level = mode == Peak ? peakFollower.process (|key|) : rmsWindow.process (key*key)   // double sum, clamped (4.3)
     keyDb = 20 * log10 (max (level, 1e-6f))
     advance state (section 4.5)
-    gain += coef[state] * (target[state] - gain)     // one-pole ramp, per sample
+    gain = rising (state) ? min (gain * upStep, 1.0f) : max (gain * downStep, rangeGain)   // one multiply + clamp
     gainOut[i] = gain
 after the loop (once per 16-sample control block, not per sample):
-    meterOpen.store (state is Open or Hold ? 1 : 0, relaxed)
-    meterGr.store (20 * log10 (gain), relaxed)
+    grDb     = 20 * log10 (gain)
+    stateIdx = (int) state
 ```
 
 No branch inside the loop allocates or calls a library function that may block. `std::log10` and `std::sqrt` are the
-only transcendental calls.
+only transcendental calls in the loop; `std::pow` for the two steps runs once per control block in `control()`.
 
 ---
 
@@ -228,11 +244,13 @@ namespace lab::dsp
 struct TransientAlign
 {
     // Fixed lookahead per sample rate (D4). Never a parameter, never changes after prepare().
-    static constexpr float lookaheadMs = 5.0f;          // PROPOSED, see O6
-    static int latency (double sampleRate) noexcept     // round (lookaheadMs * 1e-3 * sr), clamped >= 1
+    static constexpr double lookaheadSeconds = 0.005;   // 5 ms PROPOSED, see O6
+    static int latency (double sampleRate) noexcept     // floor (sr * 0.005 + 0.5), clamped >= 1
     {
-        return std::max (1, (int) std::lround (lookaheadMs * 1e-3 * sampleRate));
+        return std::max (1, (int) (sampleRate * lookaheadSeconds + 0.5));
     }
+    // 44.1 kHz -> 221 (220.5 rounds up), 48 kHz -> 240, 96 kHz -> 480. The Python side uses the same rule,
+    // int (sr * 0.005 + 0.5), never round(), whose half-to-even would give 220 at 44.1 kHz.
 
     void prepare (double sampleRate, int maxBlock) noexcept;   // sizes two DelayLine rings to latency (sr) + maxBlock
     void reset() noexcept;                                     // clears rings (silence), no click because gain is also reset
@@ -290,7 +308,14 @@ struct X11Chain : lab::host::Chain
 
     void reset() noexcept override { gate.reset(); align.reset(); level.reset(); }
 
-    void control (const float* v) noexcept override { gate.control (v); level.control (v); }
+    void control (const float* v) noexcept override
+    {
+        gate.control (v); level.control (v);
+        // Meters live in the base (handoff 3.6); the DSP headers hold plain values, the chain publishes them.
+        meters.custom[0].store (lampValue (gate.stateIndex()), std::memory_order_relaxed);   // 0 closed, 1 open, 0.5 hold
+        meters.custom[1].store (gate.gainReductionDb(), std::memory_order_relaxed);
+        meters.custom[2].store (level.gainDb(), std::memory_order_relaxed);
+    }
 
     void process (float* l, float* r, int n) noexcept override
     {
@@ -315,11 +340,14 @@ control call, as every X-16 effect does.
 
 ### 6.2 Meters (`Meters::custom` slots)
 
-| slot | source | editor use |
-|---|---|---|
-| 0 | `VocalGate::meterOpen` (0/1, plus 0.5 for Hold, PROPOSED) | gate-state lamp in GATE // ШЛЮЗ |
-| 1 | `VocalGate::meterGr` (dB, <= 0) | gain-reduction needle |
-| 2 | `LevelMatcher` gain (dB) | level-match needle (out of scope here) |
+Written by `X11Chain::control()` once per control block with `store (relaxed)` (handoff 3.6); the editor reads at
+30 Hz. The DSP headers expose plain values and own no atomics.
+
+| slot | source | value | editor use |
+|---|---|---|---|
+| 0 | `VocalGate::stateIndex()` | 1 Open or Attack, 0.5 Hold or Release, 0 Closed (PROPOSED, O10) | gate-state lamp in GATE // ШЛЮЗ |
+| 1 | `VocalGate::gainReductionDb()` | dB, <= 0 | gain-reduction needle |
+| 2 | `LevelMatcher::gainDb()` | dB | level-match needle (out of scope here) |
 
 ---
 
@@ -332,9 +360,11 @@ callers. Reported once in `prepareToPlay` via `setLatencySamples`; the base's `d
 
 ### 7.2 Gain timing relative to the detector
 
-For a step in the key at sample *t*: gain begins rising at *t*, reaches 90 % at *t + attackSamples*; the audio step
-appears at the output at *t + LOOKAHEAD*. With default values (attack 1 ms, lookahead 5 ms PROPOSED) the gate is fully
-open 4 ms before the consonant. `selfTest` case G7 asserts this to the sample.
+For a step in the key at sample *t* in Peak mode: gain begins rising at *t* and equals 1 at *t + attackSamples*
+(the slew traverses the full range in exactly that time); the audio step appears at the output at *t + LOOKAHEAD*.
+With default values (attack 1 ms, lookahead 5 ms PROPOSED) the gate is fully open 4 ms before the consonant. In RMS
+mode the key itself takes up to `windowSamples` (2.5 ms PROPOSED) to cross the threshold, leaving 1.5 ms. `selfTest`
+case G7 asserts the Peak figure to the sample and the RMS figure within the window length.
 
 ### 7.3 Gate -> matcher
 
@@ -354,36 +384,44 @@ read from files.
 | case | signal | assertion | tolerance |
 |---|---|---|---|
 | G1 closed floor | silence, then -60 dBFS noise | state stays Closed, gain == rangeGain | exact after reset |
-| G2 open | step to -20 dBFS sine | state reaches Open; gain hits 0.9 within attack ms | ±1 sample per 1 ms of attack |
-| G3 hold | burst then silence | Release starts exactly `holdSamples` after key < closeThr | ±1 sample |
-| G4 release | as G3 | gain reaches rangeGain + 10 % of span within release ms; then Closed | ±2 % of release |
+| G2 open | step to -20 dBFS sine from Closed (gain starts at rangeGain) | state reaches Open; gain == 1 exactly `attackSamples` after the key crosses openThr | exact sample |
+| G3 hold | burst then silence, hold 1 ms and 40 ms | Release starts exactly `holdSamples` after key < closeThr | exact sample |
+| G3b hold minimum | as G3 with hold at its 1 ms minimum | gate reaches Closed (never sticks in Hold) | exact |
+| G4 release | as G3 | gain == rangeGain exactly `releaseSamples` after Release starts; then Closed | exact sample |
 | G5 hysteresis | sine held at thr - hyst/2 after opening | stays Open/Hold, never Release | exact |
 | G6 chatter | key toggling ±1 dB around thr at 200 Hz | state changes <= 2 per 100 ms with hyst = 4 dB | count |
-| G7 pre-open | impulse in key at *t* | through the chain, output impulse at *t + LOOKAHEAD* carries gain >= 0.99 | exact sample |
+| G7 pre-open | impulse in key at *t*; the test composes `computeGain`, `TransientAlign::process` and the multiply itself (no `X11Chain`, which lives in `LabX11.cpp`) | Peak mode: output impulse at *t + LOOKAHEAD* carries gain == 1 | exact sample |
+| G7b pre-open, RMS | as G7 with `det_mode = RMS` | output impulse carries gain == 1 | within `windowSamples` |
 | G8 range 0 | range = 0 dB | gainOut all 1.0 regardless of state | exact |
+| G8b range change closed | range 24 -> 48 dB while Closed | gain falls at the release rate to the new floor, state stays Closed | exact sample |
+| G8c RMS silence | 10 s signal, then silence, RMS mode | key level >= 0 (never NaN), state reaches Closed | finite |
 | G9 block equivalence | same 2 s signal, blocks 1 vs 512 | identical gain streams | 1e-7 |
 | G10 rate equivalence | same ms settings at 44.1 / 48 / 96 kHz | state transition times in ms agree | ±0.05 ms |
 | G11 mode switch | Peak -> RMS mid-signal | no NaN, gain continuous (no jump > 0.1) | — |
 | G12 denormal / finite | 1e-30 input for 10 s | no NaN/inf; followers at floor | finite |
 | G13 determinism | same input twice after reset | bit-identical gain streams | exact |
-| A1 latency integer | each sample rate | `latency (sr)` is int, >= 1, == round (ms * sr / 1000) | exact |
+| A1 latency integer | each sample rate | `latency (sr)` == `(int) (sr * 0.005 + 0.5)`: 221 / 240 / 480 at 44.1 / 48 / 96 kHz | exact |
 | A2 impulse offset | impulse at 0 through `process` | appears at `latency (sr)` and nowhere else | exact |
 | A3 block independence | 3 s noise, blocks 1/7/64/3000/variable | output identical to block 512 | 1e-7 |
 | A4 reset | fill, reset, process silence | output all zero | exact |
 
 ### 8.2 Harness / Python tests touching these modules (T1-T6 of the handoff's T1-T12 budget)
 
-| test | fixture (`labtest.fixture()`) | harness flags | assertion |
-|---|---|---|---|
-| T1 floor removal | -55 dBFS noise, 3 s | defaults | output RMS <= -55 - range + 1 dB |
-| T2 tail survival | sine burst with 300 ms exponential tail | defaults | tail energy within 1 dB of input until it crosses closeThr |
-| T3 onset integrity | click train at -12 dBFS, 20 ms apart | defaults | first-sample amplitude of each click within 0.5 dB of input (lookahead works) |
-| T4 attack/hold/release | gated burst pattern | `--set gate_hold=100 --set gate_release=200` | measured hold/release from envelope within 5 % |
-| T5 latency vs reported | impulse | `--latency-check` at 44.1/48/96 kHz | C2 passes, value == `TransientAlign::latency` |
-| T6 parameter ramp | `--ramp gate_thr -80..0` over 10 s | — | no fault, no sample jump > 0.5 at any 16-sample boundary |
+`labtest.fixture()` (a copy) builds sine, noise and impulse WAVs only. The burst-with-tail, click-train and
+gated-burst signals below are generated by `x11_tests.py` itself with numpy, written to `test/out/`, and rendered with
+`--in`; every assertion is a numpy analysis of the rendered WAV (the handoff's T-test shape, 1.9).
 
-C1 (null at bypass) and C2 are the direct guarantees of section 5; C6 must list `gate` and `level`; C9 must find the
-panel titles GATE // ШЛЮЗ and DETECTOR // ДЕТЕКТОР (D9 names).
+| test | signal | harness flags | assertion |
+|---|---|---|---|
+| T1 floor removal | `fixture()` -55 dBFS noise, 3 s | defaults | output RMS <= -55 - range + 1 dB |
+| T2 tail survival | sine burst with 300 ms exponential tail (numpy) | defaults | tail energy within 1 dB of input until it crosses closeThr |
+| T3 onset integrity | click train at -12 dBFS, 20 ms apart (numpy) | defaults | first-sample amplitude of each click within 0.5 dB of input (lookahead works) |
+| T4 attack/hold/release | gated burst pattern (numpy) | `--set gate_hold=100 --set gate_release=200` | measured hold/release from envelope within 5 % |
+| T5 impulse offset in the render | `fixture()` impulse | `--list-params` for the reported latency, at 44.1/48/96 kHz | impulse in the rendered WAV sits exactly at the reported latency, which equals `(int) (sr * 0.005 + 0.5)`; complements C2's `--latency-check` |
+| T6 parameter ramp | `fixture()` noise, `--ramp gate_thr -80..0` over 10 s | — | no fault, no sample jump > 0.5 at any 16-sample boundary |
+
+C1 (null at bypass) and C2 are the direct guarantees of section 5; C6 must list `gate` and `level`; C9 must find
+every panel title of handoff 1.7, among them GATE // ШЛЮЗ and DETECTOR // ДЕТЕКТОР (D9 names).
 
 ---
 
@@ -395,12 +433,13 @@ panel titles GATE // ШЛЮЗ and DETECTOR // ДЕТЕКТОР (D9 names).
 | O2 | Detector key | mono sum 0.5 (L + R) | unspecified | max (|L|, |R|) is the alternative; vocals are mono so either works |
 | O3 | dB conversion rate | per sample | unspecified | per-16-sample decimation if C8 (20x real time) is tight |
 | O4 | Parameter ids | `gate_*`, `det_*` as in 4.4 | section 3 PENDING | append-only once installed (1.4) |
-| O5 | Ramp domain | linear one-pole | PENDING (DSP panel) | log-domain closes more gently; audibility decides |
-| O6 | Lookahead length | **5 ms** fixed | D4 PENDING ms | <= 10 ms keeps FL compensation trivial; longer buys nothing for consonants |
+| O5 | Ramp domain | constant dB-per-sample slew (one multiply + clamp), times exact | PENDING (DSP panel) | even in dB over the whole range; a linear one-pole was rejected by review (section 11) |
+| O6 | Lookahead length | **5 ms** fixed, `(int) (sr * 0.005 + 0.5)` = 221 / 240 / 480 | D4 PENDING ms | <= 10 ms keeps FL compensation trivial; longer buys nothing for consonants |
 | O7 | Default threshold | -40 dB | D6 PENDING dBFS (floor + margin) | from the DD Gate reading; stem measurements may lower it |
 | O8 | Hysteresis default | 4 dB | PENDING (DSP panel) | too small chatters, too large delays close |
-| O9 | RMS window | 10 ms fixed | unspecified | fixed per sample rate so no run-time resize |
-| O10 | Hold lamp value | 0.5 for Hold state | unspecified | purely visual |
+| O9 | RMS window | 2.5 ms fixed (half the lookahead) | unspecified | keeps RMS mode pre-opening; fixed per sample rate so no run-time resize |
+| O10 | Lamp values | 1 open/attack, 0.5 hold/release, 0 closed | unspecified | purely visual |
+| O11 | Hold minimum | 1 ms (not 0) | handoff range unspecified | the base's log smoother cannot take 0; the alternative is `Smooth::linear` with min 0 |
 
 Everything else in sections 4-8 follows directly from the handoff text and needs no confirmation.
 
@@ -408,11 +447,35 @@ Everything else in sections 4-8 follows directly from the handoff text and needs
 
 ## 10. Delivery checklist for milestone M1 (Gate) per handoff section 6
 
-- [ ] `core/dsp/Gate.h` with `VocalGate`, `selfTest()` cases G1-G13
+- [ ] `core/dsp/Gate.h` with `VocalGate`, `selfTest()` cases G1-G13 (with G3b, G7b, G8b, G8c)
 - [ ] `core/dsp/Align.h` with `TransientAlign`, `selfTest()` cases A1-A4 (or folded into `Gate.h` per O1)
 - [ ] `EffectInfo::params` rows of 4.4 after the common three; `stages = { "gate", "level" }`
-- [ ] `X11Chain` as in section 6; `latency()` from `TransientAlign`
-- [ ] `test/harness_main.cpp` `--selftest` extended to both modules
-- [ ] `test/python/x11_tests.py` T1-T6 of 8.2
-- [ ] C1, C2 (non-zero latency), C5, C6 green; F-B in FL
+- [ ] `X11Chain` as in section 6; `latency()` from `TransientAlign`; meters written by the chain
+- [ ] `test/harness_main.cpp` `--selftest` extended to Gate and Align (Leveler joins in M2)
+- [ ] `test/python/x11_tests.py` T0 and T1-T6 of 8.2
+- [ ] C1, C2 (non-zero latency) green; F-B in FL. C4-C6 and C8 belong to M2 per handoff section 6
 - [ ] `docs/DESIGN.md` records the confirmed values of section 9 and any change from this spec
+
+---
+
+## 11. Review record (revision 2)
+
+Three independent reviewers (real-time/JUCE mechanics, vocal DSP practice, X-16 conformance) read this spec against
+the handoff; each finding was then attacked by two refuters. Findings that both refuters upheld, and what changed:
+
+| # | finding | change made |
+|---|---|---|
+| R1 | Hold counter order undefined at a zero hold: a decrement-then-`== 0` reading sticks the gate open | 4.5 states the sample-exact order and uses `<= 0`; G3b added |
+| R2 | `gate_hold` min 0 with `Smooth::log`: the base's log smoother cannot take log (0) | min raised to 1 ms (O11) |
+| R3 | RMS running sum in float can go negative at silence, `sqrt` gives NaN, state machine freezes silently | double accumulator, clamp, 1e-9 floor; G8c added |
+| R4 | "10 %-90 % equals the parameter" and `onePoleCoef` disagree by a factor 2.2; "attack <= lookahead is fully pre-empted" was only true for attack <= lookahead / 2 | ramp replaced by a constant-dB slew whose traverse time is exactly the parameter; sections 3, 4.4, 4.5, 7.2, G2, G4 rewritten |
+| R5 | No coefficient defined for Closed / Open / Hold; `reset()` could read `rangeGain` before the first `control()` | every state has a direction and step (4.5); `prepare()` initialises all control-derived members from the defaults (4.2); G8b added |
+| R6 | Linear-domain one-pole "closes fast at the end" is backwards: it is fastest at the start in dB | same fix as R4; O5 updated |
+| R7 | G4 could not pass against the stated ramp definition | G4 is now exact under the slew law |
+| R8 | DSP header owned atomics with no path into `Meters::custom`; Hold lamp value inconsistent (1 vs 0.5) | atomics removed from the header; `X11Chain::control()` publishes slots 0-2 (6.2); lamp values fixed (O10) |
+| R9 | Pre-open guarantee and G7 stated for both detector modes but only true for Peak (RMS window was 10 ms, twice the lookahead) | window shortened to 2.5 ms (O9); Peak/RMS distinguished in 3, 7.2; G7b added |
+| R10 | M1 checklist claimed C5/C6; handoff puts them in M2; C9 note named two of five panel titles | section 10 and 8.2 corrected |
+
+Contested findings (one refuter each way), settled anyway because the fix was one line: the latency rule is now
+written as `(int) (sr * 0.005 + 0.5)` with the three resulting values (5.2, A1, T5), G7 composes the modules inside
+the test rather than calling `X11Chain`, and 8.2 says which signals `x11_tests.py` generates itself.
