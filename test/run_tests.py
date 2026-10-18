@@ -2,7 +2,9 @@
 T-tests (test/python/x11_tests.py): T0 the C++ self-tests of the DSP headers, T1-T12 render tests of the gate and the
 level matcher.
 
-Usage:  python -I test/run_tests.py [--only C1,C2,T3,P1] [--skip-pluginval] [--fuzz-seconds 300] [--quick]
+Usage:  python -I test/run_tests.py [--all | --plugin x11] [--only C1,C2,T3,P1] [--skip-pluginval] [--fuzz-seconds 300] [--quick]
+        (--all and --plugin x11 are accepted for the family's command line; this repository builds one plugin.)
+On Linux run it under xvfb-run (C7 pluginval and C9 open the editor): xvfb-run -a python3 -I test/run_tests.py --all
 Renders go to test/out/x11 (git-ignored); the JSON report lands in build/test-report-x11.json.
 Every render uses fixed instance ids (the harness default), so seeded signals repeat exactly.
 """
@@ -203,11 +205,15 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser()
+    parser.add_argument("--plugin", action="append", default=[], help="accepted for the family command line: x11")
+    parser.add_argument("--all", action="store_true", help="accepted for the family command line (one plugin here)")
     parser.add_argument("--only", help="comma-separated test ids, e.g. C1,C3,T2")
     parser.add_argument("--skip-pluginval", action="store_true")
     parser.add_argument("--fuzz-seconds", type=float, default=300.0)
     parser.add_argument("--quick", action="store_true", help="30 s fuzz runs")
     args = parser.parse_args()
+    if any(p != "x11" for p in args.plugin):
+        parser.error("this repository builds one plugin: x11")
     if args.quick:
         args.fuzz_seconds = min(args.fuzz_seconds, 30.0)
     only = {x.strip().upper() for x in args.only.split(",")} if args.only else None

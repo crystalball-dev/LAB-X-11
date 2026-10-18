@@ -73,12 +73,20 @@ namespace
             jassert (dsp::VocalGate::lookaheadSamples (sampleRate) == align.samples());
         }
 
+        // Faults and prepareToPlay: everything to zero.
         void reset() override
         {
             gate.reset();
             align.reset();
             level.reset();
         }
+
+        // A preset change: the base fades the effect out over 30 ms, calls flush() and fades back in over 5 ms, which
+        // is exactly the lookahead. Emptying the alignment ring here would make the wet path silent for the whole
+        // fade-in and then step back in at full level, so the ring (a pure delay of the sanitised input, like the base's
+        // own dry line) and the gate's signal-derived state are kept; the new settings reach the gate through set(),
+        // RANGE through its floor glide. Only the matcher starts over.
+        void flush() override { level.reset(); }
 
         // The lookahead is the plugin's only latency: fixed per sample rate, reported once at prepareToPlay (C2).
         int latency (double sampleRate) const override { return dsp::TransientAlign::latency (sampleRate); }

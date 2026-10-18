@@ -24,11 +24,15 @@ namespace lab::dsp
     //
     // State machine with hysteresis (open above THRESHOLD, close below THRESHOLD - HYSTERESIS):
     //   Closed -> Attack (key > open) -> Open (gain reached 1) -> Hold (key < close) -> Release (hold expired)
-    //   -> Closed (gain reached the floor). Attack falls to Release when the key drops below close before the gain
-    //   reaches 1; Hold returns to Open and Release to Attack when the key rises above open again.
+    //   -> Closed (gain reached the floor). Hold returns to Open (or Attack, if the gain is not yet up) and Release to
+    //   Attack when the key rises above open again. A false start (the key falls below close during Attack) also goes
+    //   through Hold, for the lookahead only, so the audio that triggered it still passes.
     //
-    // Ramp: a constant slew in dB, one multiply and a clamp per sample. ATTACK is the time for the whole climb from the
-    // floor (-RANGE) to 0 dB and RELEASE the time for the whole fall, exactly, at every sample rate.
+    // Timing in output time. The key runs LOOKAHEAD samples ahead of the audio it governs, so every hold is lengthened by
+    // the lookahead: Release starts HOLD after the audio itself fell below close, not HOLD - 5 ms after.
+    //
+    // Ramp: a constant slew in dB, kept in double and snapped when within half a step of its end, so ATTACK is exactly
+    // the time for the whole climb from the floor (-RANGE) to 0 dB and RELEASE exactly the time for the whole fall.
     class VocalGate
     {
     public:
@@ -45,6 +49,7 @@ namespace lab::dsp
 
         static constexpr double rmsWindowSeconds = 0.0025;   // half the lookahead, so RMS mode still opens early (O9)
         static constexpr float lowCutOffHz = 20.5f;           // LOW CUT at its 20 Hz minimum: the filter is out
+        static constexpr int floorGlide = 16;                 // a RANGE change reaches the floor over one control block
 
         static int lookaheadSamples (double sampleRate) noexcept { return TransientAlign::latency (sampleRate); }
 
@@ -53,15 +58,18 @@ namespace lab::dsp
         void prepare (double sampleRate)
         {
             sr = (float) sampleRate;
+            lookahead = lookaheadSamples (sampleRate);
             window = std::max (1, (int) (sampleRate * rmsWindowSeconds + 0.5));
             squares.assign ((size_t) window, 0.0f);
             invWindow = 1.0 / (double) window;
             lastLowCut = -1.0f;
+            lowCutOn = false;
+            rangeGain = -1.0;   // forces set() to take the floor
             set (Settings {});
             reset();
         }
 
-        // State to zero, settings kept.
+        // State to zero, settings kept. The next set() places the floor directly (no glide from a stale RANGE).
         void reset() noexcept
         {
             lowCutL.reset();
@@ -75,29 +83,52 @@ namespace lab::dsp
             floorRemaining = 0;
             holdCounter = 0;
             keyLevel = 0.0f;
+            fresh = true;
         }
 
-        // Once per control block (the base's 16 samples) with smoothed values.
+        // Once per control block (the base's 16 samples, fewer at the end of a host block) with smoothed values.
         void set (const Settings& s) noexcept
         {
             mode = s.mode;
             openLevel = dbToGain (s.thresholdDb);
             closeLevel = dbToGain (s.thresholdDb - std::max (0.0f, s.hysteresisDb));
-            const float range = std::max (0.0f, s.rangeDb);
-            rangeGain = dbToGain (-range);
-            if (std::abs (rangeGain - floorGain) > 0.0f)
+
+            // RANGE: the floor glides to a new value over 16 samples; the glide restarts only when RANGE changes, so
+            // it always lands exactly, whatever the size of the control blocks. After reset() it is placed directly.
+            const double range = (double) std::max (0.0f, s.rangeDb);
+            const double newRange = std::pow (10.0, -range / 20.0);
+            if (fresh)
             {
-                floorRemaining = floorGlide;
-                floorStep = (rangeGain - floorGain) / (float) floorGlide;
+                rangeGain = floorGain = gain = newRange;
+                floorRemaining = 0;
             }
+            else if (std::abs (newRange - rangeGain) > 0.0)
+            {
+                rangeGain = newRange;
+                floorRemaining = floorGlide;
+                floorStep = (rangeGain - floorGain) / (double) floorGlide;
+            }
+
             attackSamples = std::max (1, (int) std::lround (s.attackMs * 0.001f * sr));
             releaseSamples = std::max (1, (int) std::lround (s.releaseMs * 0.001f * sr));
             holdSamples = std::max (0, (int) std::lround (s.holdMs * 0.001f * sr));
-            upStep = dbToGain (range / (float) attackSamples);
-            downStep = dbToGain (-range / (float) releaseSamples);
+            if (state == State::hold)   // HOLD turned down during a hold takes effect now
+                holdCounter = std::min (holdCounter, holdSamples + lookahead);
+            upStep = std::pow (10.0, range / (double) attackSamples / 20.0);
+            downStep = std::pow (10.0, -range / (double) releaseSamples / 20.0);
+            upSnap = std::sqrt (upStep);
+            downSnap = std::sqrt (downStep);
+
             peak.attackCoef = 1.0f;   // instant: the lookahead, not the detector, provides the early opening
             peak.releaseCoef = onePoleCoef (std::max (0.001f, s.detReleaseMs) * 0.001f, sr);
+
+            const bool wasOn = lowCutOn;
             lowCutOn = s.lowCutHz > lowCutOffHz;
+            if (lowCutOn && ! wasOn)
+            {
+                lowCutL.reset();   // no stale integrator state from the last time the filter ran
+                lowCutR.reset();
+            }
             if (lowCutOn && std::abs (s.lowCutHz - lastLowCut) > 1.0e-3f)
             {
                 lowCutL.setHz (s.lowCutHz, 0.7071f, sr);
@@ -106,10 +137,11 @@ namespace lab::dsp
             }
         }
 
-        // n gains (linear, rangeGain .. 1) from n samples of the undelayed key; voice (optional) receives 1 while the
+        // n gains (linear, floor .. 1) from n samples of the undelayed key; voice (optional) receives 1 while the
         // gate is Open or in Hold, 0 otherwise. The audio is not touched.
         void computeGain (const float* keyL, const float* keyR, float* gainOut, float* voice, int n) noexcept
         {
+            fresh = false;
             for (int i = 0; i < n; ++i)
             {
                 float l = keyL[i], r = keyR[i];
@@ -129,38 +161,49 @@ namespace lab::dsp
                 const float rmsLevel = (float) std::sqrt (std::max (squareSum, 0.0) * invWindow);
                 keyLevel = mode == Mode::peak ? peakLevel : rmsLevel;
 
-                // The floor glides to a new RANGE over one control block (the base has already smoothed RANGE).
                 if (floorRemaining > 0)
-                {
                     floorGain = --floorRemaining == 0 ? rangeGain : floorGain + floorStep;
-                }
 
                 advance (keyLevel);
 
-                // One rule for every state: slew up (Attack, Open, Hold) or down (Release, Closed), then clamp between
-                // the floor and unity. The clamp is what keeps the gate from stalling: a floor that rises (RANGE turned
-                // down) pushes the gain up with it, and RANGE 0 pins the gain at 1 whatever the steps are.
-                gain = std::clamp (gain * (rising() ? upStep : downStep), floorGain, 1.0f);
+                // One rule for every state: slew up (Attack, Open, Hold) or down (Release, Closed), snap within half a
+                // step of the end, then clamp between the floor and unity. The clamp keeps the gate from stalling: a
+                // floor that rises (RANGE turned down) pushes the gain up with it; RANGE 0 pins the gain at 1.
+                double next;
+                if (rising())
+                {
+                    next = gain * upStep;
+                    if (next * upSnap >= 1.0)
+                        next = 1.0;
+                }
+                else
+                {
+                    next = gain * downStep;
+                    if (next * downSnap <= floorGain)
+                        next = floorGain;
+                }
+                gain = std::clamp (next, floorGain, 1.0);
 
-                if (state == State::attack && gain >= 1.0f)
+                if (state == State::attack && gain >= 1.0)
                     state = State::open;
                 else if (state == State::release && gain <= floorGain)
                     state = State::closed;
 
-                gainOut[i] = gain;
+                gainOut[i] = (float) gain;
                 if (voice != nullptr)
                     voice[i] = (state == State::open || state == State::hold) ? 1.0f : 0.0f;
             }
         }
 
         State getState() const noexcept { return state; }
-        float getGain() const noexcept { return gain; }
-        float gainReductionDb() const noexcept { return gainToDb (gain); }
+        float getGain() const noexcept { return (float) gain; }
+        float gainReductionDb() const noexcept { return gainToDb ((float) gain); }
         float keyDb() const noexcept { return gainToDb (std::max (keyLevel, 1.0e-6f)); }
         bool isOpen() const noexcept { return state == State::open || state == State::hold; }
         int getAttackSamples() const noexcept { return attackSamples; }
         int getReleaseSamples() const noexcept { return releaseSamples; }
         int getHoldSamples() const noexcept { return holdSamples; }
+        int getLookahead() const noexcept { return lookahead; }
 
         // The editor's lamp: 1 open or opening, 0.5 holding or closing, 0 closed (O10).
         float lampValue() const noexcept
@@ -179,9 +222,8 @@ namespace lab::dsp
     private:
         bool rising() const noexcept { return state == State::attack || state == State::open || state == State::hold; }
 
-        // Sample-exact transitions (spec 4.5). Hold: entered with holdCounter = holdSamples, decremented first and
-        // released at <= 0, so Release starts exactly holdSamples after the key fell below close; a hold of 0 goes
-        // straight from Open to Release. The counter can never run away.
+        // Sample-exact transitions (spec 4.5). Hold is entered with a count, decremented first and released at <= 0,
+        // so Release starts exactly that many samples later; the counter can never run away.
         void advance (float key) noexcept
         {
             switch (state)
@@ -192,23 +234,21 @@ namespace lab::dsp
                     break;
                 case State::attack:
                     if (key < closeLevel)
-                        state = State::release;   // a false start gets no hold
+                    {
+                        state = State::hold;          // a false start: no user hold, but the lookahead's worth, so the
+                        holdCounter = lookahead;      // audio that opened the gate still reaches the output open
+                    }
                     break;
                 case State::open:
                     if (key < closeLevel)
                     {
-                        if (holdSamples > 0)
-                        {
-                            state = State::hold;
-                            holdCounter = holdSamples;
-                        }
-                        else
-                            state = State::release;
+                        state = State::hold;
+                        holdCounter = holdSamples + lookahead;
                     }
                     break;
                 case State::hold:
                     if (key > openLevel)
-                        state = State::open;
+                        state = gain >= 1.0 ? State::open : State::attack;
                     else if (--holdCounter <= 0)
                         state = State::release;
                     break;
@@ -220,6 +260,7 @@ namespace lab::dsp
         }
 
         float sr = 48000.0f;
+        int lookahead = 240;
         SVF lowCutL, lowCutR;
         Follower peak;
         std::vector<float> squares;
@@ -228,53 +269,57 @@ namespace lab::dsp
 
         Mode mode = Mode::peak;
         State state = State::closed;
-        static constexpr int floorGlide = 16;   // one control block
-
-        float openLevel = 0.01f, closeLevel = 0.0063f, rangeGain = 0.063f, floorGain = 0.063f, floorStep = 0.0f;
-        float upStep = 1.0f, downStep = 1.0f, gain = 0.063f, keyLevel = 0.0f, lastLowCut = -1.0f;
+        float openLevel = 0.01f, closeLevel = 0.0063f, keyLevel = 0.0f, lastLowCut = -1.0f;
+        double rangeGain = 0.063, floorGain = 0.063, floorStep = 0.0, gain = 0.063;
+        double upStep = 1.0, downStep = 1.0, upSnap = 1.0, downSnap = 1.0;
         int attackSamples = 48, releaseSamples = 5760, holdSamples = 1920, holdCounter = 0, floorRemaining = 0;
-        bool lowCutOn = true;
+        bool lowCutOn = false, fresh = true;
     };
 
     // ---------------------------------------------------------------------------------------------------------------
-    // G1-G13 (spec section 8.1). Synthetic, seeded signals; every case is deterministic.
+    // Self-tests (spec section 8.1, extended after review). Synthetic, seeded signals; every case is deterministic.
+    // Each case is built so that a plausible mistake in the state machine, the detector or the ramp fails it.
     inline SelfTestReport VocalGate::selfTest()
     {
         SelfTestReport report;
         constexpr double pi2 = 6.283185307179586;
+        using S = State;
 
         struct Run
         {
-            std::vector<float> gain, voice;
+            std::vector<float> gain, voice, key;
             std::vector<int> state;
         };
 
-        // Runs a gate over a mono signal (duplicated to both channels) in blocks, recording gain and state per sample.
-        // `change` (optional) is called before each block with the block's start sample and may change the settings.
+        // Runs a gate over a mono signal (duplicated to both channels), calling set() before every block as the base
+        // calls control(), recording gain, voice, key and state per sample. `change` may edit the settings per block.
         auto run = [] (double sampleRate, const std::vector<float>& x, Settings s, int block, auto change)
         {
             VocalGate g;
             g.prepare (sampleRate);
-            g.set (s);
             g.reset();
             Run out;
             const int total = (int) x.size();
             out.gain.resize ((size_t) total);
             out.voice.resize ((size_t) total);
+            out.key.resize ((size_t) total);
             out.state.resize ((size_t) total);
             for (int pos = 0; pos < total; pos += block)
             {
                 const int n = std::min (block, total - pos);
-                change (g, s, pos);
+                change (s, pos);
+                g.set (s);
                 for (int i = 0; i < n; ++i)
                 {
-                    g.computeGain (x.data() + pos + i, x.data() + pos + i, out.gain.data() + pos + i, out.voice.data() + pos + i, 1);
-                    out.state[(size_t) (pos + i)] = (int) g.getState();
+                    const int k = pos + i;
+                    g.computeGain (x.data() + k, x.data() + k, out.gain.data() + k, out.voice.data() + k, 1);
+                    out.state[(size_t) k] = (int) g.getState();
+                    out.key[(size_t) k] = g.keyDb();
                 }
             }
             return out;
         };
-        auto none = [] (VocalGate&, Settings&, int) {};
+        auto none = [] (Settings&, int) {};
 
         auto sine = [&] (double sampleRate, double seconds, double hz, float levelDb, double start, double end)
         {
@@ -284,17 +329,32 @@ namespace lab::dsp
                 x[i] = a * (float) std::sin (pi2 * hz * (double) i / sampleRate);
             return x;
         };
-        auto firstIndex = [] (const std::vector<int>& st, int from, auto pred)
+        auto add = [] (std::vector<float> a, const std::vector<float>& b)
+        {
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+                a[i] += b[i];
+            return a;
+        };
+        auto first = [] (const std::vector<int>& st, int from, int value)
         {
             for (int i = std::max (0, from); i < (int) st.size(); ++i)
-                if (pred (st[(size_t) i]))
+                if (st[(size_t) i] == value)
                     return i;
             return -1;
         };
-        const int closedS = (int) State::closed, attackS = (int) State::attack, openS = (int) State::open,
-                  holdS = (int) State::hold, releaseS = (int) State::release;
+        auto ever = [] (const std::vector<int>& st, int from, int to, int value)
+        {
+            for (int i = std::max (0, from); i < std::min (to, (int) st.size()); ++i)
+                if (st[(size_t) i] == value)
+                    return true;
+            return false;
+        };
+        auto samples = [] (float ms, double rate) { return (int) std::lround (ms * 0.001f * (float) rate); };
+        const int closedS = (int) S::closed, attackS = (int) S::attack, openS = (int) S::open, holdS = (int) S::hold,
+                  releaseS = (int) S::release;
+        const float floor24 = (float) std::pow (10.0, -24.0 / 20.0);
 
-        // G1: -60 dBFS noise under a -40 dB threshold: closed throughout, gain exactly the floor.
+        // G1: -60 dBFS noise under a -40 dB threshold: closed throughout, the gain exactly the floor from sample 0.
         {
             std::vector<float> x (24000);
             Rng rng;
@@ -306,74 +366,72 @@ namespace lab::dsp
             bool closed = true;
             for (size_t i = 0; i < x.size(); ++i)
             {
-                worst = std::max (worst, std::abs (r.gain[i] - dbToGain (-24.0f)));
+                worst = std::max (worst, std::abs (r.gain[i] - floor24));
                 closed = closed && r.state[i] == closedS;
             }
             report.add ("g1_closed_floor", (double) worst, closed && worst <= 0.0f);
         }
 
-        // G2: a -20 dBFS sine from silence: gain reaches exactly 1 attackSamples after the gate starts opening.
+        // G2: a -20 dBFS sine from silence: the gain reaches exactly 1 attackSamples after the gate starts opening
+        // (the first rise is on the Attack sample itself), at 44.1, 48 and 96 kHz.
         {
-            Settings s;
-            const auto x = sine (48000.0, 0.3, 1000.0, -20.0f, 0.1, 0.3);
-            const auto r = run (48000.0, x, s, 16, none);
-            const int start = firstIndex (r.state, 0, [&] (int v) { return v == attackS; });
-            int full = -1;
-            for (int i = std::max (0, start); i < (int) r.gain.size(); ++i)
-                if (r.gain[(size_t) i] >= 1.0f) { full = i; break; }
-            const int expected = (int) std::lround (s.attackMs * 48.0f);
-            const int diff = full - start + 1;   // the first rise happens on the Attack sample itself
-            report.add ("g2_attack_samples", (double) diff, start >= 0 && std::abs (diff - expected) <= 1
-                                                             && r.state[(size_t) full] == openS);
+            bool ok = true;
+            int shown = 0;
+            for (const double rate : { 44100.0, 48000.0, 96000.0 })
+            {
+                Settings s;
+                const auto x = sine (rate, 0.3, 1000.0, -20.0f, 0.1, 0.3);
+                const auto r = run (rate, x, s, 16, none);
+                const int start = first (r.state, 0, attackS);
+                const int full = first (r.state, start, openS);
+                const int diff = full - start + 1;
+                ok = ok && start > 0 && diff == samples (s.attackMs, rate) && r.gain[(size_t) full] >= 1.0f
+                     && r.gain[(size_t) full - 1] < 1.0f;
+                if (rate > 47999.0 && rate < 48001.0)
+                    shown = diff;
+            }
+            report.add ("g2_attack_samples_exact", (double) shown, ok);
         }
 
-        // G3: hold 40 ms and 1 ms: Release starts exactly holdSamples after the key fell below close.
-        for (const float holdMs : { 40.0f, 1.0f })
+        // G3: HOLD 40, 1 and 0 ms: Release starts exactly HOLD + LOOKAHEAD after the key fell below close (HOLD after
+        // the audio did).
+        for (const float holdMs : { 40.0f, 1.0f, 0.0f })
         {
             Settings s;
             s.holdMs = holdMs;
-            const auto x = sine (48000.0, 0.6, 1000.0, -20.0f, 0.05, 0.25);
-            const auto r = run (48000.0, x, s, 16, none);
-            const int holdAt = firstIndex (r.state, 0, [&] (int v) { return v == holdS; });
-            const int releaseAt = firstIndex (r.state, holdAt, [&] (int v) { return v == releaseS; });
-            const int expected = (int) std::lround (holdMs * 48.0f);
-            report.add (holdMs > 2.0f ? "g3_hold_40ms" : "g3_hold_1ms", (double) (releaseAt - holdAt),
-                        holdAt >= 0 && releaseAt - holdAt == expected);
-        }
-
-        // G3b: hold 0: Open goes straight to Release, and the gate reaches Closed (never sticks).
-        {
-            Settings s;
-            s.holdMs = 0.0f;
             const auto x = sine (48000.0, 0.8, 1000.0, -20.0f, 0.05, 0.25);
             const auto r = run (48000.0, x, s, 16, none);
-            const int holdAt = firstIndex (r.state, 0, [&] (int v) { return v == holdS; });
-            const int releaseAt = firstIndex (r.state, 0, [&] (int v) { return v == releaseS; });
-            report.add ("g3b_hold_zero_closes", (double) r.state.back(), holdAt < 0 && releaseAt > 0 && r.state.back() == closedS);
+            const int holdAt = first (r.state, 0, holdS);
+            const int releaseAt = first (r.state, holdAt, releaseS);
+            const int expected = samples (holdMs, 48000.0) + 240;
+            const char* name = holdMs > 2.0f ? "g3_hold_40ms" : holdMs > 0.5f ? "g3_hold_1ms" : "g3_hold_0ms";
+            report.add (name, (double) (releaseAt - holdAt), holdAt > 0 && releaseAt - holdAt == expected && r.state.back() == closedS);
         }
 
-        // G4: release: the gain reaches the floor exactly releaseSamples after Release starts, then Closed.
+        // G4: RELEASE: the gain reaches the floor exactly releaseSamples after Release starts, then Closed; 44.1/48/96.
         {
-            Settings s;
-            const auto x = sine (48000.0, 0.8, 1000.0, -20.0f, 0.05, 0.25);
-            const auto r = run (48000.0, x, s, 16, none);
-            const int releaseAt = firstIndex (r.state, 0, [&] (int v) { return v == releaseS; });
-            int floorAt = -1;
-            for (int i = std::max (0, releaseAt); i < (int) r.gain.size(); ++i)
-                if (r.gain[(size_t) i] <= dbToGain (-24.0f)) { floorAt = i; break; }
-            const int expected = (int) std::lround (s.releaseMs * 48.0f);
-            const int diff = floorAt - releaseAt + 1;   // the first fall happens on the Release sample itself
-            report.add ("g4_release_samples", (double) diff, releaseAt > 0 && std::abs (diff - expected) <= 1
-                                                             && r.state[(size_t) floorAt] == closedS);
+            bool ok = true;
+            int shown = 0;
+            for (const double rate : { 44100.0, 48000.0, 96000.0 })
+            {
+                Settings s;
+                const auto x = sine (rate, 0.8, 1000.0, -20.0f, 0.05, 0.25);
+                const auto r = run (rate, x, s, 16, none);
+                const int releaseAt = first (r.state, 0, releaseS);
+                const int closedAt = first (r.state, releaseAt, closedS);
+                const int diff = closedAt - releaseAt + 1;
+                ok = ok && releaseAt > 0 && diff == samples (s.releaseMs, rate) && std::abs (r.gain[(size_t) closedAt] - floor24) <= 0.0f;
+                if (rate > 47999.0 && rate < 48001.0)
+                    shown = diff;
+            }
+            report.add ("g4_release_samples_exact", (double) shown, ok);
         }
 
         // G5: hysteresis: after opening, a sine at THRESHOLD - HYSTERESIS / 2 keeps the gate open.
         {
             Settings s;
-            auto x = sine (48000.0, 1.0, 1000.0, -20.0f, 0.05, 0.2);
-            const auto low = sine (48000.0, 1.0, 1000.0, s.thresholdDb - 0.5f * s.hysteresisDb, 0.2, 1.0);
-            for (size_t i = 0; i < x.size(); ++i)
-                x[i] += low[i];
+            const auto x = add (sine (48000.0, 1.0, 1000.0, -20.0f, 0.05, 0.2),
+                                sine (48000.0, 1.0, 1000.0, s.thresholdDb - 0.5f * s.hysteresisDb, 0.2, 1.0));
             const auto r = run (48000.0, x, s, 16, none);
             int notOpen = 0;
             for (size_t i = (size_t) (0.1 * 48000); i < x.size(); ++i)
@@ -388,8 +446,7 @@ namespace lab::dsp
             for (size_t i = 0; i < x.size(); ++i)
             {
                 const double t = (double) i / 48000.0;
-                const float db = s.thresholdDb + (float) std::sin (pi2 * 200.0 * t);
-                x[i] = dbToGain (db) * (float) std::sin (pi2 * 1000.0 * t);
+                x[i] = dbToGain (s.thresholdDb + (float) std::sin (pi2 * 200.0 * t)) * (float) std::sin (pi2 * 1000.0 * t);
             }
             const auto r = run (48000.0, x, s, 16, none);
             int worst = 0;
@@ -403,18 +460,18 @@ namespace lab::dsp
             report.add ("g6_chatter_changes_per_100ms", (double) worst, worst <= 2);
         }
 
-        // G7 / G7b: the lookahead, composed here from the gate, TransientAlign and the multiply (the chain itself lives
-        // in plugins/x11/LabX11.cpp). A sine onset at t comes out at t + LOOKAHEAD with the gain already at 1.
+        // G7 / G7b: the lookahead, composed from the gate, TransientAlign and the multiply (the chain itself lives in
+        // plugins/x11/LabX11.cpp): from a closed gate, every output sample of a sine burst equals the input sample
+        // LOOKAHEAD earlier, exactly, from the burst's first sample on (Peak and RMS detectors).
         for (const Mode m : { Mode::peak, Mode::rms })
         {
             Settings s;
             s.mode = m;
             const double rate = 48000.0;
-            auto x = sine (rate, 0.3, 1000.0, -20.0f, 0.1, 0.3);
+            const auto x = sine (rate, 0.3, 1000.0, -20.0f, 0.1, 0.3);
             const int onset = (int) (0.1 * rate);
             VocalGate g;
             g.prepare (rate);
-            g.set (s);
             g.reset();
             TransientAlign a;
             a.prepare (rate);
@@ -422,16 +479,19 @@ namespace lab::dsp
             for (int pos = 0; pos < (int) x.size(); pos += 16)
             {
                 const int n = std::min (16, (int) x.size() - pos);
+                g.set (s);
                 g.computeGain (l.data() + pos, r.data() + pos, gains.data() + pos, nullptr, n);
                 a.process (l.data() + pos, r.data() + pos, n);
+                for (int i = pos; i < pos + n; ++i)
+                {
+                    l[(size_t) i] *= gains[(size_t) i];
+                    r[(size_t) i] *= gains[(size_t) i];
+                }
             }
-            const int out = onset + a.samples();
-            // Every output sample from the onset's arrival on carries gain 1 (the onset itself is exactly 0 for a sine
-            // starting at phase 0, so the gain is checked rather than the sample).
-            float worst = 1.0f;
-            for (int i = out; i < out + 480; ++i)
-                worst = std::min (worst, gains[(size_t) i]);
-            report.add (m == Mode::peak ? "g7_preopen_peak" : "g7b_preopen_rms", (double) worst, worst >= 1.0f);
+            float worst = 0.0f;
+            for (int k = 0; k < 4800; ++k)
+                worst = std::max (worst, std::abs (l[(size_t) (onset + a.samples() + k)] - x[(size_t) (onset + k)]));
+            report.add (m == Mode::peak ? "g7_preopen_peak" : "g7b_preopen_rms", (double) worst, worst <= 0.0f);
         }
 
         // G8: RANGE 0: the gate is transparent.
@@ -447,80 +507,77 @@ namespace lab::dsp
         }
 
         // G8b: RANGE 24 -> 48 dB while closed: the gain falls to the new floor at the release rate (24 dB of the 48 dB
-        // span takes half of RELEASE) and the state stays Closed.
+        // span is exactly half of RELEASE) and the state stays Closed.
         {
             Settings s;
             const std::vector<float> x (48000, 0.0f);
             const int at = 4800;
-            auto change = [&] (VocalGate& g, Settings& st, int pos)
-            {
-                if (pos == at)
-                {
-                    st.rangeDb = 48.0f;
-                    g.set (st);
-                }
-            };
-            const auto r = run (48000.0, x, s, 16, change);
+            const auto r = run (48000.0, x, s, 16, [&] (Settings& st, int pos) { if (pos == at) st.rangeDb = 48.0f; });
+            const float floor48 = (float) std::pow (10.0, -48.0 / 20.0);
             int reached = -1;
             for (int i = at; i < (int) x.size(); ++i)
-                if (r.gain[(size_t) i] <= dbToGain (-48.0f)) { reached = i; break; }
-            const int expected = (int) std::lround (s.releaseMs * 48.0f) / 2;
+                if (r.gain[(size_t) i] <= floor48) { reached = i; break; }
             bool closed = true;
             for (const int v : r.state)
                 closed = closed && v == closedS;
-            report.add ("g8b_range_change_closed", (double) (reached - at + 1), reached > 0 && std::abs (reached - at + 1 - expected) <= 2 && closed);
+            report.add ("g8b_range_deeper_closed", (double) (reached - at + 1), reached - at + 1 == samples (120.0f, 48000.0) / 2 && closed);
         }
 
-        // G8c: RMS mode, 10 s of a loud signal then silence: the key stays finite and non-negative, the gate closes.
+        // G8c: RANGE 48 -> 24 dB while closed: the gain follows the floor up within the 16-sample glide.
+        {
+            Settings s;
+            s.rangeDb = 48.0f;
+            const std::vector<float> x (9600, 0.0f);
+            const int at = 4800;
+            const auto r = run (48000.0, x, s, 16, [&] (Settings& st, int pos) { if (pos == at) st.rangeDb = 24.0f; });
+            report.add ("g8c_range_shallower_closed", (double) r.gain[(size_t) at + 15],
+                        std::abs (r.gain[(size_t) at + 15] - floor24) <= 0.0f && r.gain[(size_t) at] > (float) std::pow (10.0, -48.0 / 20.0));
+        }
+
+        // G8d: RMS mode, 10 s of a loud signal then silence: the key stays finite, the gate closes.
         {
             Settings s;
             s.mode = Mode::rms;
-            auto x = sine (48000.0, 11.0, 220.0, -6.0f, 0.0, 10.0);
-            VocalGate g;
-            g.prepare (48000.0);
-            g.set (s);
-            g.reset();
-            std::vector<float> gains (x.size());
+            const auto x = sine (48000.0, 11.0, 220.0, -6.0f, 0.0, 10.0);
+            const auto r = run (48000.0, x, s, 16, none);
             bool finite = true;
-            for (int pos = 0; pos < (int) x.size(); pos += 16)
-            {
-                const int n = std::min (16, (int) x.size() - pos);
-                g.computeGain (x.data() + pos, x.data() + pos, gains.data() + pos, nullptr, n);
-                finite = finite && std::isfinite (g.keyDb()) && std::isfinite (g.getGain());
-            }
-            report.add ("g8c_rms_silence_finite", (double) g.keyDb(), finite && g.getState() == State::closed);
+            for (size_t i = 0; i < x.size(); ++i)
+                finite = finite && std::isfinite (r.key[i]) && std::isfinite (r.gain[i]);
+            report.add ("g8d_rms_silence_finite", (double) r.key.back(), finite && r.state.back() == closedS);
         }
 
-        // G9: block equivalence: blocks of 1, 7 and 16 give identical gains.
+        // G9: block equivalence: control blocks of 1, 7 and 16 samples (set() before each, as the base) give identical
+        // gains on a signal with opens, holds, releases and a RANGE change.
         {
-            Settings s;
-            auto x = sine (48000.0, 2.0, 330.0, -18.0f, 0.2, 0.9);
-            const auto b = sine (48000.0, 2.0, 1200.0, -45.0f, 0.9, 2.0);
-            for (size_t i = 0; i < x.size(); ++i)
-                x[i] += b[i];
-            auto runBlocks = [&] (int block)
-            {
-                VocalGate g;
-                g.prepare (48000.0);
-                g.set (s);
-                g.reset();
-                std::vector<float> gains (x.size());
-                for (int pos = 0; pos < (int) x.size(); pos += block)
-                    g.computeGain (x.data() + pos, x.data() + pos, gains.data() + pos, nullptr, std::min (block, (int) x.size() - pos));
-                return gains;
-            };
-            const auto a = runBlocks (16);
+            auto x = add (sine (48000.0, 2.0, 330.0, -18.0f, 0.2, 0.9), sine (48000.0, 2.0, 1200.0, -45.0f, 0.9, 2.0));
+            // The change lands on sample 60032, a multiple of 7 and of 16, so every block size sees it at the same sample.
+            auto change = [] (Settings& st, int pos) { st.rangeDb = pos < 60032 ? 24.0f : 40.0f; };
+            const auto a = run (48000.0, x, Settings {}, 16, change);
             float worst = 0.0f;
             for (const int block : { 1, 7 })
             {
-                const auto c = runBlocks (block);
-                for (size_t i = 0; i < a.size(); ++i)
-                    worst = std::max (worst, std::abs (a[i] - c[i]));
+                const auto c = run (48000.0, x, Settings {}, block, change);
+                for (size_t i = 0; i < a.gain.size(); ++i)
+                    worst = std::max (worst, std::abs (a.gain[i] - c.gain[i]));
             }
             report.add ("g9_block_equivalence", (double) worst, worst <= 0.0f);
         }
 
-        // G10: rate equivalence: the hold time in ms is the same at 44.1, 48 and 96 kHz (within 0.05 ms).
+        // G9b: RANGE 0 with control blocks of 1 and 7 samples: the gate still reaches Open and reports voice.
+        {
+            Settings s;
+            s.rangeDb = 0.0f;
+            const auto x = sine (48000.0, 1.0, 220.0, -12.0f, 0.0, 1.0);
+            bool ok = true;
+            for (const int block : { 1, 7 })
+            {
+                const auto r = run (48000.0, x, s, block, none);
+                ok = ok && r.state.back() == openS && r.voice.back() >= 1.0f;
+            }
+            report.add ("g9b_range_zero_small_blocks_open", ok ? 1.0 : 0.0, ok);
+        }
+
+        // G10: rate equivalence: HOLD + LOOKAHEAD in ms is the same at 44.1, 48 and 96 kHz within 0.05 ms.
         {
             Settings s;
             double lo = 1.0e9, hi = -1.0e9;
@@ -528,8 +585,8 @@ namespace lab::dsp
             {
                 const auto x = sine (rate, 0.6, 1000.0, -20.0f, 0.05, 0.25);
                 const auto r = run (rate, x, s, 16, none);
-                const int holdAt = firstIndex (r.state, 0, [&] (int v) { return v == holdS; });
-                const int releaseAt = firstIndex (r.state, holdAt, [&] (int v) { return v == releaseS; });
+                const int holdAt = first (r.state, 0, holdS);
+                const int releaseAt = first (r.state, holdAt, releaseS);
                 const double ms = (double) (releaseAt - holdAt) * 1000.0 / rate;
                 lo = std::min (lo, ms);
                 hi = std::max (hi, ms);
@@ -539,17 +596,8 @@ namespace lab::dsp
 
         // G11: DETECTOR Peak -> RMS mid-signal: no jump in the gain, nothing non-finite.
         {
-            Settings s;
             const auto x = sine (48000.0, 1.0, 440.0, -20.0f, 0.05, 1.0);
-            auto change = [&] (VocalGate& g, Settings& st, int pos)
-            {
-                if (pos == 24000)
-                {
-                    st.mode = Mode::rms;
-                    g.set (st);
-                }
-            };
-            const auto r = run (48000.0, x, s, 16, change);
+            const auto r = run (48000.0, x, Settings {}, 16, [] (Settings& st, int pos) { if (pos >= 24000) st.mode = Mode::rms; });
             float jump = 0.0f;
             bool finite = true;
             for (size_t i = 24000; i < r.gain.size(); ++i)
@@ -567,7 +615,7 @@ namespace lab::dsp
             bool ok = true;
             for (size_t i = 0; i < x.size(); ++i)
                 ok = ok && std::isfinite (r.gain[i]) && r.state[i] == closedS;
-            report.add ("g12_denormal_input", (double) r.gain.back(), ok);
+            report.add ("g12_denormal_input", (double) r.gain.back(), ok && std::abs (r.gain.back() - floor24) <= 0.0f);
         }
 
         // G13: determinism: the same input twice after reset gives identical gains.
@@ -577,18 +625,139 @@ namespace lab::dsp
             rng.seed (0x13u);
             for (size_t i = 0; i < x.size(); ++i)
                 x[i] = ((i / 9000) % 2 == 0 ? 0.2f : 0.001f) * rng.bi();
-            VocalGate g;
-            g.prepare (48000.0);
-            g.set (Settings {});
-            std::vector<float> a (x.size()), b (x.size());
-            g.reset();
-            g.computeGain (x.data(), x.data(), a.data(), nullptr, (int) x.size());
-            g.reset();
-            g.computeGain (x.data(), x.data(), b.data(), nullptr, (int) x.size());
+            const auto a = run (48000.0, x, Settings {}, 16, none);
+            const auto b = run (48000.0, x, Settings {}, 16, none);
             float worst = 0.0f;
-            for (size_t i = 0; i < a.size(); ++i)
-                worst = std::max (worst, std::abs (a[i] - b[i]));
+            for (size_t i = 0; i < a.gain.size(); ++i)
+                worst = std::max (worst, std::abs (a.gain[i] - b.gain[i]));
             report.add ("g13_determinism", (double) worst, worst <= 0.0f);
+        }
+
+        // G14: retrigger: a second burst during Release goes Release -> Attack (never Closed in between) and the gain
+        // rises from where it was, never falling and never faster than the attack slew.
+        {
+            Settings s;
+            // Burst 1 ends at 0.20 s; the key falls below close about 55 ms later, Hold lasts 45 ms, Release 120 ms:
+            // a second burst at 0.35 s lands about 50 ms into Release.
+            const auto x = add (sine (48000.0, 0.8, 1000.0, -20.0f, 0.05, 0.20), sine (48000.0, 0.8, 1000.0, -20.0f, 0.35, 0.6));
+            const auto r = run (48000.0, x, s, 16, none);
+            const int releaseAt = first (r.state, 0, releaseS);
+            const int againAt = first (r.state, releaseAt, attackS);
+            bool ok = releaseAt > 0 && againAt > releaseAt && ! ever (r.state, releaseAt, againAt, closedS);
+            const double up = std::pow (10.0, 24.0 / 48.0 / 20.0) * (1.0 + 1.0e-6);
+            for (int i = againAt; ok && i < (int) r.gain.size() && r.gain[(size_t) i - 1] < 1.0f; ++i)
+                ok = r.gain[(size_t) i] >= r.gain[(size_t) i - 1] && (double) r.gain[(size_t) i] <= (double) r.gain[(size_t) i - 1] * up;
+            report.add ("g14_retrigger_from_release", ok ? 1.0 : 0.0, ok);
+        }
+
+        // G15: a dip shorter than HOLD: the key falls below close (fast detector) but returns in time: Hold -> Open,
+        // no Release, the gain stays 1.
+        {
+            Settings s;
+            s.detReleaseMs = 2.0f;
+            const auto x = add (sine (48000.0, 0.6, 1000.0, -20.0f, 0.05, 0.25), sine (48000.0, 0.6, 1000.0, -20.0f, 0.27, 0.45));
+            const auto r = run (48000.0, x, s, 16, none);
+            const int openAt = first (r.state, 0, openS);
+            const int holdAt = first (r.state, openAt, holdS);
+            const int backAt = first (r.state, holdAt, openS);
+            bool ok = holdAt > 0 && backAt > holdAt && backAt < (int) (0.28 * 48000) && ! ever (r.state, openAt, (int) (0.44 * 48000), releaseS);
+            for (int i = openAt; ok && i < (int) (0.44 * 48000); ++i)
+                ok = r.gain[(size_t) i] >= 1.0f;
+            report.add ("g15_short_dip_holds", (double) (backAt - holdAt), ok);
+        }
+
+        // G16: a false start: ATTACK 20 ms and a 2 ms click: Attack -> Hold (the lookahead only) -> Release -> Closed,
+        // never Open.
+        {
+            Settings s;
+            s.attackMs = 20.0f;
+            s.detReleaseMs = 2.0f;
+            const auto x = sine (48000.0, 0.5, 1000.0, -20.0f, 0.1, 0.102);
+            const auto r = run (48000.0, x, s, 16, none);
+            const int attackAt = first (r.state, 0, attackS);
+            const int holdAt = first (r.state, attackAt, holdS);
+            const int releaseAt = first (r.state, holdAt, releaseS);
+            const bool ok = attackAt > 0 && holdAt > attackAt && releaseAt - holdAt == 240 && ! ever (r.state, 0, (int) r.state.size(), openS)
+                            && r.state.back() == closedS;
+            report.add ("g16_false_start", (double) (releaseAt - holdAt), ok);
+        }
+
+        // G17: LOW CUT: a -30 dBFS 40 Hz sine opens the gate with LOW CUT off (20 Hz) and leaves it closed at 300 Hz.
+        {
+            const auto x = sine (48000.0, 0.5, 40.0, -30.0f, 0.0, 0.5);
+            Settings off, on;
+            off.lowCutHz = 20.0f;
+            on.lowCutHz = 300.0f;
+            const auto a = run (48000.0, x, off, 16, none);
+            const auto b = run (48000.0, x, on, 16, none);
+            const bool ok = ever (a.state, 0, (int) x.size(), openS) && ! ever (b.state, 0, (int) x.size(), attackS);
+            report.add ("g17_low_cut", ok ? 1.0 : 0.0, ok);
+        }
+
+        // G17b: LOW CUT switched back on after a loud low passage: no stale filter state opens the gate on silence.
+        {
+            auto x = sine (48000.0, 1.6, 110.0, -14.0f, 0.0, 0.6);
+            const auto r = run (48000.0, x, Settings {}, 16, [] (Settings& st, int pos)
+            {
+                st.lowCutHz = pos >= (int) (0.3 * 48000) && pos < (int) (1.2 * 48000) ? 20.0f : 80.0f;
+            });
+            const bool ok = ! ever (r.state, (int) (1.2 * 48000), (int) x.size(), attackS) && r.state.back() == closedS;
+            report.add ("g17b_low_cut_reenable", ok ? 1.0 : 0.0, ok);
+        }
+
+        // G18: calibration: a 400 Hz sine at -20 dBFS reads -20 dB on the Peak key (its maximum over a cycle) and
+        // -23.01 dB on the RMS key (2.5 ms is exactly one period), LOW CUT off.
+        {
+            Settings s;
+            s.lowCutHz = 20.0f;
+            const auto x = sine (48000.0, 0.3, 400.0, -20.0f, 0.0, 0.3);
+            const auto p = run (48000.0, x, s, 16, none);
+            s.mode = Mode::rms;
+            const auto q = run (48000.0, x, s, 16, none);
+            float peakMax = -200.0f, rmsLo = 200.0f, rmsHi = -200.0f;
+            for (size_t i = (size_t) (0.2 * 48000); i < x.size(); ++i)
+            {
+                peakMax = std::max (peakMax, p.key[i]);
+                rmsLo = std::min (rmsLo, q.key[i]);
+                rmsHi = std::max (rmsHi, q.key[i]);
+            }
+            const bool ok = std::abs (peakMax + 20.0f) <= 0.1f && std::abs (rmsLo + 23.01f) <= 0.1f && std::abs (rmsHi + 23.01f) <= 0.1f;
+            report.add ("g18_key_calibration_peak_db", (double) peakMax, ok);
+        }
+
+        // G19: DET RELEASE: after a DC step to zero, the Peak key falls 20 dB in DET RELEASE x ln 10 samples (+-1).
+        {
+            Settings s;
+            s.lowCutHz = 20.0f;
+            s.detReleaseMs = 10.0f;
+            std::vector<float> x (24000, 0.0f);
+            std::fill (x.begin(), x.begin() + 4800, 0.1f);
+            const auto r = run (48000.0, x, s, 16, none);
+            int fell = -1;
+            for (int i = 4800; i < (int) x.size(); ++i)
+                if (r.key[(size_t) i] <= -40.0f) { fell = i; break; }
+            const int expected = (int) std::lround (0.010 * 48000.0 * std::log (10.0));
+            report.add ("g19_det_release_samples", (double) (fell - 4800 + 1), std::abs (fell - 4800 + 1 - expected) <= 1);
+        }
+
+        // G20: HOLD turned down during a hold takes effect at once (500 ms -> 1 ms).
+        {
+            Settings s;
+            s.holdMs = 500.0f;
+            const auto x = sine (48000.0, 1.2, 1000.0, -20.0f, 0.05, 0.2);
+            int changedAt = -1;
+            const auto r = run (48000.0, x, s, 16, [&] (Settings& st, int pos)
+            {
+                if (pos >= (int) (0.3 * 48000))
+                {
+                    if (changedAt < 0)
+                        changedAt = pos;
+                    st.holdMs = 1.0f;
+                }
+            });
+            const int releaseAt = first (r.state, changedAt, releaseS);
+            const bool ok = changedAt > 0 && releaseAt > 0 && releaseAt - changedAt <= samples (1.0f, 48000.0) + 240 + 1;
+            report.add ("g20_hold_change_during_hold", (double) (releaseAt - changedAt), ok);
         }
 
         return report;

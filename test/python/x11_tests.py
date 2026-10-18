@@ -191,7 +191,7 @@ def gate_tests(h, record, want):
         rows = []
         for k in range(4):
             i = int((0.2 + 0.4 * k) * sr)
-            d = 20 * math.log10(abs(mw[i]) / abs(md[i]))
+            d = 20 * math.log10((abs(mw[i]) + 1e-30) / (abs(md[i]) + 1e-30))
             rows.append(round(d, 3))
             worst = max(worst, abs(d))
         for k in range(4):
@@ -218,13 +218,13 @@ def gate_tests(h, record, want):
             m, _, sr = mono_of(wav)
             g = gain_curve(m, probe, sr, 0.001)
             k0 = int(0.62 / 0.001)
-            start = next(k for k in range(k0, len(g)) if g[k] < -0.3)
-            end = next(k for k in range(start, len(g)) if g[k] <= -GATE_RANGE + 0.3)
-            fall_start[hold] = start * 0.001
-            durations[hold] = (end - start) * 0.001
+            start = next((k for k in range(k0, len(g)) if g[k] < -0.3), None)
+            end = next((k for k in range(start, len(g)) if g[k] <= -GATE_RANGE + 0.3), None) if start is not None else None
+            fall_start[hold] = start * 0.001 if start is not None else float("nan")
+            durations[hold] = (end - start) * 0.001 if end is not None else float("nan")
         hold_ms = (fall_start[100] - fall_start[0]) * 1000
         release_ms = durations[100] * 1000
-        ok = abs(hold_ms - 100) <= 2.0 and abs(release_ms - 200) <= 200 * 0.05
+        ok = abs(hold_ms - 100) <= 2.0 and abs(release_ms - 200) <= 200 * 0.05   # NaN (the gate never closed) fails
         record("T4", "HOLD 100 ms delays the close by 100 ms (+-2); RELEASE 200 ms falls the whole RANGE in 200 ms (+-5 %)", ok,
                {"hold_ms": round(hold_ms, 2), "release_ms": round(release_ms, 2)})
 
@@ -250,9 +250,31 @@ def gate_tests(h, record, want):
                {"max_jump": jump, "faults": st.get("faults")})
 
 
+def switch_test(h, record, want):
+    """T13: a preset change on a sustained vocal-level tone is click-free. C4 (drums, an absolute 0.5 jump) cannot see a
+    vocal click: the drums' own steps are larger than one."""
+    if not want("T13"):
+        return
+    base = ["--signal", "sine:220", "--level", "-3", "--seconds", "2"]
+    rows, ok = {}, True
+    for sr in (44100, 48000, 96000):
+        steady_wav, steady = h.render(f"t13_steady_{sr}", base + ["--sr", str(sr)])
+        wav, st = h.render(f"t13_switch_{sr}", base + ["--sr", str(sr), "--program-at", "0@1.0"])
+        m, _, rate = mono_of(wav)
+        s, _, _ = mono_of(steady_wav)
+        # Window by window against the same render without the switch (a 1 ms window of a 220 Hz tone swings with phase).
+        dip = max(an.rms_db(an.segment(s, rate, t, t + 0.001)) - an.rms_db(an.segment(m, rate, t, t + 0.001))
+                  for t in np.arange(0.98, 1.06, 0.001))
+        jump, steady_jump = float(st.get("max_jump", "1")), float(steady.get("max_jump", "0"))
+        rows[str(sr)] = {"max_jump": jump, "steady_jump": steady_jump, "worst_1ms_dip_db": round(dip, 2)}
+        ok = ok and jump <= 1.5 * steady_jump and dip <= 1.5 and int(st.get("faults", "1")) == 0
+    record("T13", "preset switch on a -3 dBFS 220 Hz tone: no step above 1.5x the tone's own, no 1 ms dip over 1.5 dB", ok, rows)
+
+
 def x11_tests(h, record, want):
     gate_tests(h, record, want)
     matcher_tests(h, record, want)
+    switch_test(h, record, want)
 
 
 def matcher_tests(h, record, want):
