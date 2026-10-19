@@ -96,6 +96,19 @@ namespace lab::dsp
             return x;
         }
 
+        // Brown (red) noise: white through a 10 Hz one-pole, falling 6 dB per octave above it. Room rumble, HVAC and
+        // traffic slope like this; the voicing test reads it as voiced (the documented limit, L3 and L23d).
+        static Sig brown (Rng& rng, size_t n, double sr, double peakRms)
+        {
+            OnePole lp;
+            lp.setHz (10.0f, (float) sr);
+            Sig x (n);
+            for (auto& v : x)
+                v = lp.lowpass (rng.bi());
+            scaleTo (x, peakRms);
+            return x;
+        }
+
         // Vocal-tract noise: white through three band-passes (500 / 1500 / 2500 Hz, Q 3) summed, then a 4 kHz one-pole.
         static Sig tract (Rng& rng, size_t n, double sr)
         {
@@ -232,6 +245,31 @@ namespace lab::dsp
             add ("k997_" + rateName (sr), m.levelDb(), std::abs (m.levelDb() + 20.0f) <= 0.05f);
         }
 
+        // L1b: the detector is per channel. A tone on the left or the right alone reads 3.01 dB under L = R; an
+        // anti-phase voice (R = -L) is voiced on every hop and reads the same as L = R.
+        for (const double sr : rates)
+        {
+            const auto x = sine (sr, 3.0, 997.0, 0.1);
+            const Sig silent (x.size(), 0.0f);
+            M a = fresh (sr), b = fresh (sr);
+            drive (a, x, silent, States (x.size(), openS), defaultsV(), none);
+            drive (b, silent, x, States (x.size(), openS), defaultsV(), none);
+            add ("k997_left_only_" + rateName (sr), a.levelDb(), std::abs (a.levelDb() + 23.01f) <= 0.05f);
+            add ("k997_right_only_" + rateName (sr), b.levelDb(), std::abs (b.levelDb() + 23.01f) <= 0.05f);
+        }
+        {
+            const double sr = 48000.0;
+            const auto v = voice (sr, 4.0, 7, 0.5);
+            Sig neg (v.size());
+            for (size_t i = 0; i < v.size(); ++i)
+                neg[i] = -v[i];
+            M same0 = fresh (sr), anti = fresh (sr);
+            drive (same0, v, v, States (v.size(), openS), cV(), none);
+            drive (anti, v, neg, States (v.size(), openS), cV(), none);
+            add ("antiphase_voice", (double) anti.levelDb() - (double) same0.levelDb(),
+                 anti.hopsRejected == 0 && anti.hopsAdmitted == same0.hopsAdmitted && std::abs (anti.levelDb() - same0.levelDb()) <= 0.01f);
+        }
+
         // L2: the K-weighting's shape, run directly on sines (gain of the 2nd second's RMS).
         for (const double sr : rates)
         {
@@ -256,17 +294,12 @@ namespace lab::dsp
             const size_t n = samples (sr, 10.0);
             const int hops = (int) (n / (size_t) M::lookahead (sr));
             struct Case { const char* label; Sig x; bool voiced; };
-            Rng w, p;
-            w.seed (1);
-            p.seed (1);
             std::vector<Case> cases;
             cases.push_back ({ "997", sine (sr, 10.0, 997.0, 0.1), true });
             cases.push_back ({ "300", sine (sr, 10.0, 300.0, 0.1), true });
             cases.push_back ({ "voice", voice (sr, 10.0, 7, 0.5), true });
             cases.push_back ({ "2k", sine (sr, 10.0, 2000.0, 0.1), false });
             cases.push_back ({ "4k", sine (sr, 10.0, 4000.0, 0.1), false });
-            cases.push_back ({ "white", white (w, n, 0.1), false });
-            cases.push_back ({ "pink", pink (p, n, 0.05), false });
             for (const auto& c : cases)
             {
                 M m = fresh (sr);
@@ -285,6 +318,37 @@ namespace lab::dsp
                     const double ratio = db (lo / hi);
                     add ("voicing_ratio997_" + rateName (sr), ratio, std::abs (ratio - 8.3) <= 0.4);
                 }
+            }
+            // White and pink noise over 16 seeds: at most 0.1 % of hops admitted (measured: pink about 0.03 % at
+            // 44.1 kHz, 0.02 % at 48 kHz, 0 at 96 kHz; white 0) and never a level.
+            for (const int kind : { 0, 1 })
+            {
+                int64_t admitted = 0, total = 0;
+                bool noLevelEver = true;
+                for (uint32_t seed = 1; seed <= 16; ++seed)
+                {
+                    Rng rng;
+                    rng.seed (seed);
+                    const auto x = kind == 0 ? white (rng, n, 0.1) : pink (rng, n, 0.05);
+                    M m = fresh (sr);
+                    drive (m, x, States (x.size(), openS), cV());
+                    admitted += m.hopsAdmitted;
+                    total += m.hopsAdmitted + m.hopsRejected;
+                    noLevelEver = noLevelEver && same (m.levelDb(), M::noLevel);
+                }
+                const double rate = (double) admitted / (double) std::max<int64_t> (1, total);
+                add (std::string ("voicing_") + (kind == 0 ? "white16_" : "pink16_") + rateName (sr), rate, rate <= 0.001 && noLevelEver);
+            }
+            // Brown noise (room rumble, HVAC): the band-ratio test reads it as voiced. Documented, not hidden: with
+            // the gate open on it, only the level guard and THRESHOLD keep it out (L23d, README).
+            {
+                Rng rng;
+                rng.seed (3);
+                const auto x = brown (rng, n, sr, 0.03);
+                M m = fresh (sr);
+                drive (m, x, States (x.size(), openS), cV());
+                const double rate = (double) m.hopsAdmitted / (double) std::max<int64_t> (1, m.hopsAdmitted + m.hopsRejected);
+                add ("voicing_brown_documented_" + rateName (sr), rate, rate >= 0.9);
             }
         }
 
@@ -394,6 +458,38 @@ namespace lab::dsp
             add ("freeze_pp", hi - lo, same (hi, lo) && levelSame);
             add ("freeze_value", r.applied[a - 1], same (r.applied[a], r.applied[a - 1]) && std::abs (r.applied[a - 1] - 7.978) <= 0.005);
             slewWorst = std::max (slewWorst, slewRatio (r, sr));
+        }
+
+        // L8b: the gate-state contract. Hold measures exactly as Open; Release and Attack hold the gain and the level
+        // (a tone 10 dB under the window during them changes nothing).
+        {
+            const double sr = 48000.0;
+            const auto x = sine (sr, 10.0, 997.0, dbfs (-30.0));
+            M a = fresh (sr), b = fresh (sr);
+            const auto ra = drive (a, x, States (x.size(), openS), cV());
+            const auto rb = drive (b, x, States (x.size(), (uint8_t) M::hold), cV());
+            bool identical = true;
+            for (size_t i = 0; i < x.size(); ++i)
+                identical = identical && same (ra.outL[i], rb.outL[i]) && same (ra.applied[i], rb.applied[i]);
+            add ("state_hold_measures", identical ? 1.0 : 0.0, identical);
+
+            for (const uint8_t s : { (uint8_t) M::release, (uint8_t) M::attack })
+            {
+                auto y = sine (sr, 7.0, 997.0, dbfs (-30.0));
+                States st (y.size(), openS);
+                const size_t s0 = samples (sr, 3.0), s1 = samples (sr, 5.0);
+                for (size_t i = s0; i < s1; ++i)
+                {
+                    y[i] = (float) (dbfs (-40.0) * std::sin (twoPi * 997.0 * (double) i / sr));
+                    st[i] = s;
+                }
+                M m = fresh (sr);
+                const auto r = drive (m, y, st, cV());
+                bool held = true;
+                for (size_t i = s0; i < s1; ++i)
+                    held = held && same (r.applied[i], r.applied[s0 - 1]) && same (r.level[i], r.level[s0 - 1]);
+                add (s == M::release ? "state_release_holds" : "state_attack_holds", held ? 1.0 : 0.0, held);
+            }
         }
 
         // L9: consonant-like bursts (15 ms, peaks 20 dB over a sine at TARGET) neither pump nor crush. L19 repeats it.
@@ -550,8 +646,9 @@ namespace lab::dsp
             add ("step_preroll_" + rn, worst, worst <= 1.0e-9 && lands && peakStep <= 9.0 * std::sin (pi / (2.0 * (double) la)) + 1.0e-9);
         }
 
-        // L12: Step holds a +0.6 dB change (under the 1 dB commit) and places a +1.6 dB one in one pre-roll.
-        for (const double second : { -29.4, -28.4 })
+        // L12: Step holds a +0.875 dB change (inside the 1 dB commit, across a grid boundary: a commit there would move
+        // the step to 10.5) and places a +1.6 dB one in one pre-roll. L27b continues the hold run with a flush().
+        for (const double second : { -29.125, -28.4 })
         {
             const double sr = 48000.0;
             std::vector<double> levels (16, -30.0);
@@ -567,10 +664,56 @@ namespace lab::dsp
             for (size_t i = on[8]; i < x.size(); ++i)
                 changed += same (r.applied[i], r.applied[i - 1]) ? 0 : 1;
             if (second < -29.0)
-                add ("step_hold", (double) changed, changed == 0 && same (r.applied.back(), 12.0));
+            {
+                add ("step_hold", (double) changed, changed == 0 && same (r.applied.back(), 12.0) && std::abs (m.rideDb - 11.125) <= 0.03);
+                // L27b: a preset change under Step re-quantises the ride (11.125 -> 10.5) on the first sample after it.
+                m.flush();
+                const V v = cV (1.0f);
+                m.control (v.data());
+                float l = 0.0f, rr = 0.0f;
+                const uint8_t s = closedS;
+                m.process (&l, &rr, &s, 1);
+                add ("step_flush_requantise", m.appliedDb, same (m.stepDb, 10.5) && same (m.appliedDb, 10.5));
+            }
             else
                 add ("step_move", (double) changed, changed == M::lookahead (sr) && same (r.applied.back(), 10.5)
                                                      && std::abs (m.rideDb - 10.40) <= 0.03);
+        }
+
+        // L12b: Step re-triggered from Release (lines closer than hold + release, the gate never Closed): each onset
+        // is still a commit, its pre-roll runs in the LA samples before the line's audio, nowhere else.
+        {
+            const double sr = 48000.0;
+            Sig x;
+            States st;
+            std::vector<size_t> on;
+            stepPhrases (sr, { -30, -30, -30, -30, -29.4, -29.4, -29.4, -29.4 }, x, st, on);
+            const size_t la = (size_t) M::lookahead (sr), hold40 = samples (sr, 0.040), len = samples (sr, 2.0);
+            for (size_t k = 0; k < on.size(); ++k)
+            {
+                const size_t end = on[k] + len + la, next = k + 1 < on.size() ? on[k + 1] : x.size();
+                for (size_t i = end; i < next; ++i)
+                    st[i] = i < end + hold40 ? (uint8_t) M::hold : (uint8_t) M::release;
+                if (k > 0)
+                    for (size_t i = on[k]; i < on[k] + 48; ++i)
+                        st[i] = (uint8_t) M::attack;
+            }
+            M m = fresh (sr);
+            const auto r = drive (m, x, st, cV (1.0f));
+            const double want[] = { 0, 9, 12, 12, 12, 12, 12, 12 };
+            bool ok = true;
+            for (size_t k = 0; k < on.size(); ++k)
+                ok = ok && same (r.applied[on[k] + la], want[k]);
+            int outside = 0;
+            for (size_t i = 1; i < x.size(); ++i)
+                if (! same (r.applied[i], r.applied[i - 1]))
+                {
+                    bool inside = false;
+                    for (const size_t o : on)
+                        inside = inside || (i >= o && i < o + la);
+                    outside += inside ? 0 : 1;
+                }
+            add ("step_retrigger", r.applied[on[1] + la], ok && outside == 0);
         }
 
         // L14: Step's late commit after 4 s of voice with no gap: three moves, each starting at hopLen - 2 + k lateLen,
@@ -696,6 +839,16 @@ namespace lab::dsp
             for (size_t i = samples (sr, 9.5); i < samples (sr, 11.0); ++i)
                 held = held && same (r2.applied[i], r2.applied[samples (sr, 9.5) - 1]);
             add ("limit_change_closed", held ? 1.0 : 0.0, held);
+
+            // L20b: the same change under Step: the held step is re-clamped to 4 and glides there at the slew cap
+            // (8 dB at 6 dB/s: 1.333 s), never resting above the new limit.
+            M m3 = fresh (sr);
+            const auto r3 = drive (m3, x, x, States (x.size(), openS), cV (1.0f), lower);
+            bool under = true;
+            for (size_t i = samples (sr, 11.34); i < x.size(); ++i)
+                under = under && r3.applied[i] <= 4.0 + 1.0e-9;
+            const double ratio3 = slewRatio (r3, sr);
+            add ("limit_change_step", ratio3, under && ratio3 <= 1.0 + 1.0e-9);
         }
 
         // L21: one NaN input sample: exactly one non-finite output sample, the filters heal at the hop's end.
@@ -899,6 +1052,33 @@ namespace lab::dsp
                 const double rise = r.applied[g1 - 1] - r.applied[g0];
                 add ("open_gap_bleed22", rise, rise >= 5.0 && same (r.lamp[(g0 + g1) / 2], 1.0f));
             }
+
+            // L23d: brown room tone (rumble, HVAC) passes the voicing test like hum: held 30 dB under the voice,
+            // ridden toward MAX BOOST 20 dB under (documented: THRESHOLD must sit above room rumble too).
+            for (const double under : { 30.0, 20.0 })
+            {
+                size_t g0 = 0, g1 = 0, p3 = 0;
+                const auto probe = layout (0, 4.0, humScale, g0, g1, p3);
+                M cal = fresh (sr);
+                const auto rc = drive (cal, probe.first, probe.second, settings (1.0f, -18.0f, 1.0f, 6.0f, 9.0f, 0.0f));
+                const float target = rc.level[p3 - 1];
+                Rng rng;
+                rng.seed (17);
+                auto x = probe.first;
+                auto rumble = brown (rng, g1 - g0, sr, 1.0);
+                M meter = fresh (sr);
+                drive (meter, rumble, States (rumble.size(), openS), settings (1.0f, -60.0f, 1.0f, 18.0f, 9.0f, 0.0f));
+                const double gainTo = dbfs ((double) target - under - (double) meter.levelDb());
+                for (size_t i = 0; i < rumble.size(); ++i)
+                    x[g0 + i] = (float) (rumble[i] * gainTo);
+                M m = fresh (sr);
+                const auto r = drive (m, x, probe.second, settings (1.0f, target, 1.0f, 6.0f, 9.0f, 0.0f));
+                const double rise = r.applied[g1 - 1] - r.applied[g0];
+                if (under > 25.0)
+                    add ("open_gap_brown30", rise, std::abs (rise) <= 0.001);
+                else
+                    add ("open_gap_brown20_documented", rise, rise >= 4.0);
+            }
         }
 
         // L24: a take that drops d dB: acquired within one phrase up to 20 dB, two at 24 dB; at 28 dB the guard holds.
@@ -1033,6 +1213,48 @@ namespace lab::dsp
             drive (ref, x, States (x.size(), openS), cV());
             const double diff = (double) m.levelDb() - (double) ref.levelDb();
             add ("staccato", diff, std::abs (diff) <= 0.6);
+        }
+        // L28b: the burst clamp against plosive thumps that pass voicing (25 ms of 50 Hz once a second, +26 / +32 dB
+        // over the voice): the gain's ripple is at most 0.6 of an unclamped reference's and under 0.8 dB.
+        {
+            const double sr = 48000.0;
+            const auto v0 = voice (sr, 12.0, 11, dbfs (-6.0));
+            const double voiceRms = rms (v0);
+            const size_t len = samples (sr, 0.025);
+            for (const double over : { 26.0, 32.0 })
+            {
+                auto x = v0;
+                for (int k = 1; k < 12; ++k)
+                {
+                    const size_t a = samples (sr, (double) k + 0.3);
+                    double peak = 0.0;
+                    Sig th (len);
+                    for (size_t i = 0; i < len; ++i)
+                    {
+                        th[i] = (float) (std::sin (twoPi * 50.0 * (double) i / sr) * 0.5 * (1.0 - std::cos (twoPi * (double) i / (double) (len - 1))));
+                        peak = std::max (peak, std::abs ((double) th[i]));
+                    }
+                    for (size_t i = 0; i < len; ++i)
+                        x[a + i] += (float) (th[i] / peak * voiceRms * dbfs (over));
+                }
+                const V v = settings (1.0f, -20.486f, 1.0f, 6.0f, 9.0f, 0.0f);
+                M m = fresh (sr), ref = fresh (sr);
+                ref.burstLimit = std::numeric_limits<double>::infinity();
+                const auto r = drive (m, x, States (x.size(), openS), v);
+                const auto rr = drive (ref, x, States (x.size(), openS), v);
+                auto pp = [&] (const Run& run)
+                {
+                    double lo = 1.0e9, hi = -1.0e9;
+                    for (size_t i = samples (sr, 3.0); i < x.size(); ++i)
+                    {
+                        lo = std::min (lo, run.applied[i]);
+                        hi = std::max (hi, run.applied[i]);
+                    }
+                    return hi - lo;
+                };
+                const double mine = pp (r), theirs = pp (rr);
+                add ("thump_" + std::to_string ((int) over), mine, mine <= 0.6 * theirs && mine <= 0.8);
+            }
         }
         {
             const double sr = 48000.0;

@@ -56,9 +56,31 @@ others' safest ideas were grafted in. Its 125 self-tests reproduce the design pr
 One deliberate change from the spec, recorded in its implementation record (M1-M9): **the 20 ms voicing test is
 +3.5 dB, not +6 dB.** At +6 dB breathy singing (harmonics 6 dB over noise) was admitted on 43 % of its 5 ms hops. No
 threshold reaches the spec's 80 % without admitting breath-like noise, because in each syllable dip the voice falls
-under the noise. +3.5 dB admits 66 % and still admits no white, pink or vocal-tract noise. The consequence, accepted
-and documented: breathy lines are ridden about 1.4 to 1.9 times more slowly and settle 1 to 1.5 dB under a clean line
-of the same loudness. Breaths never move the gain.
+under the noise. +3.5 dB admits 66 %; white and vocal-tract noise are never admitted and pink noise on about 0.02 % of
+hops over 16 seeds, never enough to form a level. The consequence, accepted and documented: breathy lines are ridden
+about 1.4 to 1.9 times more slowly and settle 1 to 1.5 dB under a clean line of the same loudness. Breaths never move
+the gain.
+
+### Review of M2
+
+A second review (real-time and host lens, DSP lens, test lens; two refuters per finding, each finding reproduced)
+upheld nine findings and refuted six.
+
+- **Room rumble reads as voice (documented, not fixed).** The voicing test compares two bands, so it reads spectral
+  tilt only. Room tone falling 6 dB per octave or more (brown noise, HVAC curves, traffic) is admitted like a voice.
+  With the gate open on such room tone (THRESHOLD set below it), the matcher holds it 30 dB under the voice but rides
+  it toward MAX BOOST 20 dB under, as it does hum. The specs and the README now say so, and L3 and L23d pin both sides.
+  The reviewer's fix, a periodicity test (the low band's normalised autocorrelation over 2.5 to 12.5 ms lags), measured
+  brown noise 2.5 %, voice 100 % and breathy voice at HNR 6 dB 99 % in its prototype, which would also lift the breathy
+  admission above. It is not in 0.1.0: it changes which hops of real vocals are measured, and only real vocals can
+  validate that. **It is yours to decide** after the listening round.
+- **Eight test gaps closed.** Eleven mutants of `Leveler.h` passed the whole suite: Step's limit re-clamp and flush
+  re-quantise, its commit hysteresis, the Hold / Release / Attack contract, Step re-triggered from Release, the burst
+  clamp, a detector reading one channel only, and the per-hop voicing test at render level. New and changed cases
+  catch all eleven (L1b, L3, L8b, L12, L12b, L20b, L27b, L28b, T12(d')).
+- **Test robustness.** T9 and T12 record a failure instead of stopping the suite when a render goes wrong; the runner
+  records any test group that raises and always writes its report; T0 pins its case counts (179, of which 146 are the
+  matcher's).
 
 ## M3: presets, editor, tests
 
@@ -85,9 +107,9 @@ of the same loudness. Breaths never move the gain.
 | D10 | Unit tests | `selfTest()` in the DSP headers, printed by `--selftest` and asserted as T0, as proposed |
 | D11 | Theme | Oxide (Deep Zone), 960 x 560 |
 
-Open from the matcher design for your decision: whether breathy delivery should be ridden more eagerly at the cost of
-occasionally measuring breath noise (the voicing threshold, above), and whether a later version should link doubles'
-TARGET to the lead (it is copied by hand in 0.1.0).
+Open from the matcher design for your decision: the periodicity voicing test (above), which would reject room rumble
+and ride breathy delivery as eagerly as clean singing; and whether a later version should link doubles' TARGET to the
+lead (it is copied by hand in 0.1.0).
 
 ## Verification, Linux build, 2026-10-19
 
@@ -102,11 +124,11 @@ TARGET to the lead (it is copied by hand in 0.1.0).
 | C5 fuzz | 300 s each at blocks 1, 7, 64, 3000 and variable, 44.1 and 48 kHz: no fault, no non-finite sample, no growth |
 | C6 guard | injections at GATE, LEVEL and OUTPUT caught, silenced and logged by name |
 | C7 pluginval | strictness 5 and 10 pass |
-| C8 CPU | 172 to 281 times real time at 48 kHz, 64-sample blocks |
+| C8 CPU | 183 to 274 times real time at 48 kHz, 64-sample blocks |
 | C9 editor | 960 x 560, every panel title present |
-| T0 self-tests | 159 of 159 |
+| T0 self-tests | 179 of 179 (33 gate and alignment, 145 matcher, the defaults check) |
 | T1-T6 gate | room tone 24 dB down; tails untouched; onsets 0.0 dB; hold 100.0 ms, release 195 ms; latency exact; no steps under a THRESHOLD sweep |
-| T7-T12 matcher | +12.00 dB from -30 dBFS in 2.89 s at every rate; limits exact; gain frozen through gaps (0.0 dB pp); bursts move it under 0.012 dB; takes 12 dB apart land 1.2 dB apart; breaths and hold tails ignored; Gate Only bit-exact; no added latency |
+| T7-T12 matcher | +12.00 dB from -30 dBFS in 2.89 s at every rate; limits exact; gain frozen through gaps (0.0 dB pp); bursts move it under 0.012 dB; takes 12 dB apart land 1.2 dB apart; breaths and hold tails ignored (an abrupt breath right after a word moves it at most 0.004 dB); Gate Only bit-exact; no added latency |
 | T13 preset switch on a vocal-level tone | no step above the tone's own, no dip |
 | P1 loudness | every preset within 0.05 dB |
 

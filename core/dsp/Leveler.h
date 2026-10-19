@@ -38,8 +38,10 @@ namespace lab::dsp
 
         static constexpr double hopSeconds = 0.005, absFloorMs = 1.17247e-7, relGate = 0.01, guardRatio = 0.01;
         // Voicing (L.4): the 500 Hz band over the 6 kHz band by +3.5 dB across 20 ms and +3.01 dB in the hop alone. The
-        // spec's +6.02 dB over 20 ms admitted only 43 % of the hops of breathy voice (HNR 6 dB, L32); +3.5 dB admits 66 %
-        // and still admits none of white, pink or vocal-tract noise (four seeds each). Below +3.5 dB pink noise leaks.
+        // spec's +6.02 dB over 20 ms admitted only 43 % of the hops of breathy voice (HNR 6 dB, L32); +3.5 dB admits 66 %.
+        // White and vocal-tract noise are never admitted; pink noise on about 0.02 % of hops (16 seeds; 0.1-0.25 % at
+        // +3.01 dB), never enough for a level. The test reads spectral tilt only: noise falling 6 dB per octave or more
+        // (brown room rumble, HVAC) reads as voiced, so with the gate open on it only the level guard keeps it out.
         static constexpr double burstCeiling = 10.0, voiceRatio = 2.2387211385683, hopVoiceRatio = 2.0;
         static constexpr double preFloorDb = 20.0;                                            // before a level: TARGET - MAX BOOST - 20 dB
         static constexpr int windowHops = 80, minFillHops = 20, voiceHops = 4;

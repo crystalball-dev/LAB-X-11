@@ -236,9 +236,15 @@ def main():
         report["tests"].append({"id": test_id, "name": name, "pass": bool(ok), **detail})
         print(f"{'PASS' if ok else 'FAIL'}  {test_id:3s} {name}  {json.dumps(detail, ensure_ascii=False)[:420]}", flush=True)
 
-    common_tests(h, spec, presets, record, want, args)
-    spec["tests"](h, record, want)
-    loudness_test(h, spec, presets, record, want)
+    # A test group that raises (a regression the analysis did not expect) is recorded as a failure, and the rest of the
+    # suite still runs and the report is still written.
+    for label, group in (("common", lambda: common_tests(h, spec, presets, record, want, args)),
+                         ("x11", lambda: spec["tests"](h, record, want)),
+                         ("loudness", lambda: loudness_test(h, spec, presets, record, want))):
+        try:
+            group()
+        except Exception as e:  # noqa: BLE001
+            record("ERR", f"{label} tests raised", False, {"error": repr(e)[:400]})
     passed = sum(t["pass"] for t in report["tests"])
     print(f"{passed}/{len(report['tests'])} passed")
     BUILD.mkdir(exist_ok=True)

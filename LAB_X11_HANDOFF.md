@@ -544,6 +544,8 @@ base cloned read-only from github.com/crystalball-dev/lab-x-16. `docs/DESIGN.md`
   change from its spec: the 20 ms voicing test at +3.5 dB (breathy voice admitted on 66 % of hops, breath noise on
   none).
 - **M3.** The eight presets of 5.4 (no OUTPUT trims needed, P1), the editor, T7-T13 render tests, the editor PNG.
-- **Verification.** `run_tests.py --all`: 24 of 24 (C1-C9 with pluginval 5 and 10, T0-T13, P1).
+- **Review of M2.** Nine findings upheld: room rumble reads as voice to the matcher (documented and pinned by tests; a
+  periodicity test is left as the user's option) and eight test gaps (eleven mutants now caught).
+- **Verification.** `run_tests.py --all`: 24 of 24 (C1-C9 with pluginval 5 and 10, T0-T13 with 179 self-tests, P1).
 - **Still open:** section 5.2 / 5.3 / Appendix B stem measurements (THRESHOLD and TARGET defaults stay PROVISIONAL);
   the FL checks F-A to F-E on Windows; decisions D7 and D8 (as built, see `docs/DESIGN.md`) and D9 naming for the user.

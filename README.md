@@ -33,7 +33,7 @@ DETECTOR picks the louder channel's peak or a 2.5 ms RMS, DET RELEASE sets how f
 
 **LEVEL // УРОВЕНЬ** measures the vocal's loudness (BS.1770 K-weighting, the last 400 ms of voice) and moves one slow
 gain toward TARGET. It listens only while the gate is open and the sound is voiced: gaps, breaths, sibilants,
-consonant bursts and room tone hold the gain exactly where it is, so nothing is pumped up between lines.
+consonant bursts and hiss-like room tone hold the gain exactly where it is, so nothing is pumped up between lines.
 
 - AMOUNT scales the whole correction: 100 % lands each phrase on TARGET, 75 % (the default) keeps a quarter of the
   line-to-line contour, 0 % turns the stage off exactly.
@@ -53,8 +53,8 @@ voice, GAP when the gate is shut); the matcher's LEVEL in LUFS against TARGET; t
 
 1. Put LAB X-11 in slot 1 of the vocal insert, before EQ and compression.
 2. Play a gap between lines. Raise THRESHOLD until the gate lamp reads CLOSED in the gaps and OPEN on every word. The
-   KEY readout shows what the detector hears. Keep THRESHOLD above hum and bleed: it is also the matcher's voice
-   detector.
+   KEY readout shows what the detector hears. Keep THRESHOLD above hum, bleed and room rumble (HVAC, traffic): it is
+   also the matcher's voice detector, and those sounds read as voice to it.
 3. Play a typical verse and read LEVEL. Set TARGET to it. The average correction is then about 0 dB, so the vocal's
    fader balance against the snare and the drive into the compressors stay as they were; only the line-to-line spread
    shrinks.
@@ -172,7 +172,7 @@ would list the plugin twice). Rescan in FL's plugin manager; LAB X-11 appears un
 - **C1-C9**, the LAB X family's common checks: null at bypass, latency reported equals measured at 44.1 / 48 / 96 kHz,
   state round trip, click-free preset switch, 300 s fuzz runs at block sizes 1 to 3000, the fault guard at every stage,
   pluginval at strictness 5 and 10, CPU at least 20 times real time, and the editor snapshot.
-- **T0**, 159 C++ self-tests inside the DSP headers (`LabX11Render --selftest`): every gate state transition and its
+- **T0**, 179 C++ self-tests inside the DSP headers (`LabX11Render --selftest`): every gate state transition and its
   timing to the sample, the lookahead, and the matcher's calibration, convergence, limits, freeze, burst, breath and
   sibilant rejection, Step law and block-size independence.
 - **T1-T13**, renders of synthetic signals analysed with numpy: room tone removed, word tails kept, onsets intact,

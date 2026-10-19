@@ -22,6 +22,8 @@ LOOKAHEAD_S = 0.005
 # The gate's defaults (plugins/x11/LabX11.cpp, docs/SPEC_LOOKAHEAD_GATE_AND_ALIGNMENT.md section 4.4).
 GATE_THR, GATE_HYST, GATE_RANGE = -40.0, 4.0, 24.0
 
+EXPECTED_SELFTESTS, EXPECTED_LEVEL_SELFTESTS = 179, 146
+
 # Settings that take the level matcher out, so the gate tests measure the gate alone.
 MATCHER_OFF = sets("level_amount=0")
 # Settings that take the gate out (RANGE 0), so the matcher tests measure the matcher alone.
@@ -60,9 +62,14 @@ def gate_tests(h, record, want):
     if want("T0"):
         st = h.run(["--selftest"])
         cases = int(st.get("selftest_cases", "0"))
+        level_cases = sum(1 for k in st if k.startswith("selftest_level_") and k.endswith("_ok"))
         failed = sorted(k[len("selftest_"):-3] for k, v in st.items() if k.startswith("selftest_") and k.endswith("_ok") and v != "1")
-        record("T0", "C++ self-tests of Align.h, Gate.h, Leveler.h and DelayLine.h all pass", st["exit"] == 0 and cases > 0 and not failed,
-               {"cases": cases, "failed": failed, "delay_mono": st.get("selftest_delay_mono")})
+        # Pinned counts: a dropped or short-circuited suite fails T0 instead of passing with fewer cases. Update them when
+        # a case is added (33 gate and alignment cases, 145 matcher cases plus the defaults check L31).
+        ok = st["exit"] == 0 and cases == EXPECTED_SELFTESTS and level_cases == EXPECTED_LEVEL_SELFTESTS and not failed
+        record("T0", "C++ self-tests of Align.h, Gate.h, Leveler.h and DelayLine.h all pass, every expected case present", ok,
+               {"cases": cases, "level_cases": level_cases, "expected": [EXPECTED_SELFTESTS, EXPECTED_LEVEL_SELFTESTS],
+                "failed": failed, "delay_mono": st.get("selftest_delay_mono")})
 
     if want("T1"):
         noise = fixture("x11_room_tone", SR, 3.0, [(0.0, 3.0, "noise", 0, -55.0)])
@@ -235,7 +242,7 @@ def k_loudness(x, sr, mask=None):
     return -0.691 + 10 * math.log10(2 * float(np.mean(y ** 2)) + 1e-30)
 
 
-def voice_phrase(sr, dur, seed, lufs=None):
+def voice_phrase(sr, dur, seed, lufs=None, fade_out=True):
     """voice_phrase of L.13: a 140 Hz harmonic stack (h = 1..24 at 1/h), a wandering 0 to -20 dB syllable envelope,
     15 ms raised-cosine edges, scaled to the given K-loudness."""
     rng = np.random.default_rng(seed)
@@ -252,7 +259,8 @@ def voice_phrase(sr, dur, seed, lufs=None):
     e = int(0.015 * sr)
     w = 0.5 * (1 - np.cos(np.pi * np.arange(e) / e))
     x[:e] *= w
-    x[-e:] *= w[::-1]
+    if fade_out:
+        x[-e:] *= w[::-1]
     if lufs is not None:
         x *= 10 ** ((lufs - k_loudness(x, sr)) / 20)
     return x
@@ -456,9 +464,13 @@ def matcher_tests(h, record, want):
         a, z, _ = two_render(h, "t9_freeze", x, sr, PIN + sets("level_amount=1", "level_boost=18"))
         i6 = int(6.0 * sr)
         drop = np.where((np.arange(len(x)) >= i6) & (np.abs(x) > 1e-6) & (np.abs(z) < np.abs(x) * 10 ** (-0.05 / 20)))[0]
-        r = int(drop[0])
-        t9 = (x, r)
-        if want("T9"):
+        if drop.size == 0:   # the gate never released: record a failure instead of stopping the suite
+            if want("T9"):
+                record("T9", "freeze: through a 4 s gate gap the matcher's gain does not move", False, {"error": "gate never released"})
+        else:
+            t9 = (x, int(drop[0]))
+        if want("T9") and t9 is not None:
+            r = t9[1]
             tw, gw = window_gain(a, z, sr)
             span = (tw >= r / sr) & (tw + 0.002 <= 10.0 - 0.006)
             pp = float(gw[span].max() - gw[span].min())
@@ -616,7 +628,10 @@ def matcher_tests(h, record, want):
     if want("T12"):
         rows, ok = {}, True
         # (a) Level Only: RANGE 0. The gate's state still freezes the matcher through the gap.
-        if t9 is not None:
+        if t9 is None:
+            rows["a_level_only"] = {"error": "T9's render did not release"}
+            ok = False
+        else:
             x, r = t9
             a, z, _ = two_render(h, "t12a_level_only", x, sr, PIN + sets("level_amount=1", "level_boost=18", "gate_range=0"))
             tw, gw = window_gain(a, z, sr)
@@ -684,9 +699,9 @@ def matcher_tests(h, record, want):
         levels = [-20, -23, -17, -20, -24, -18]
         phrases = [voice_phrase(sr, 2.0, 1300 + k, lv) for k, lv in enumerate(levels)]
         worst = {}
-        for abrupt in (False, True):
+        for abrupt in (False,):
             for kind in ("white", "pink", "tract"):
-                for rel in ((-10, -15) if abrupt else (-10, -15, -22)):
+                for rel in (-10, -15, -22):
                     def build(with_breath):
                         rng = np.random.default_rng(8)
                         parts, onsets = [], []
@@ -715,6 +730,40 @@ def matcher_tests(h, record, want):
                     worst[tag] = round(max(diffs), 5)
         rows["d_breath_onset_diff_db"] = worst
         ok = ok and max(worst.values()) <= 0.1
+        # (d') Abrupt breaths straight after the word (no gap, no fade-out): the voice's last hops are still in the
+        # 20 ms voicing ring when the breath starts, so only the per-hop test keeps the breath out. The gain may not
+        # move by more than 0.008 dB anywhere inside a breath after its first 2 L samples.
+        abrupt_pp = {}
+        phrases_open = [voice_phrase(sr, 2.0, 1300 + k, lv, fade_out=False) for k, lv in enumerate(levels)]
+        for kind in ("white", "pink", "tract"):
+            for rel in (-10, -15):
+                rng = np.random.default_rng(8)
+                parts, breaths, pos = [], [], 0
+                for k, ph in enumerate(phrases_open):
+                    parts.append(ph)
+                    pos += len(ph)
+                    n = int(0.4 * sr)
+                    b = breath_noise(kind, n, sr, 900 + k) * np.minimum(1.0, np.arange(n) / (0.010 * sr))
+                    b *= math.sqrt(np.mean(ph ** 2)) * 10 ** (rel / 20) / math.sqrt(np.mean(b ** 2))
+                    parts.append(b)
+                    breaths.append((pos, pos + n))
+                    pos += n
+                    gap = white_rms(rng, int(0.15 * sr), -70.0)
+                    parts.append(gap)
+                    pos += len(gap)
+                x = np.concatenate(parts)
+                a, z, _ = two_render(h, f"t12d2_{kind}_{-rel}", x, sr, PIN + sets("gate_thr=-60", "level_amount=1"))
+                g = sample_gain(a, z)
+                L = latency_for(sr)
+                worst_pp = 0.0
+                for s, e in breaths:
+                    seg = g[s + 2 * L:e]
+                    seg = seg[~np.isnan(seg)]
+                    if len(seg):
+                        worst_pp = max(worst_pp, float(seg.max() - seg.min()))
+                abrupt_pp[f"{kind}_{-rel}"] = round(worst_pp, 5)
+        rows["d2_abrupt_breath_pp_db"] = abrupt_pp
+        ok = ok and max(abrupt_pp.values()) <= 0.008
         # (e) Gate Only (preset 6) equals AMOUNT 0 at the defaults, bit for bit.
         x = tone(sr, 12.0, -30.0)
         p6, _ = render_in(h, "t12e_gate_only", x, sr, ["--program", "6"])
@@ -728,7 +777,7 @@ def matcher_tests(h, record, want):
         a, z, st = two_render(h, "t12f_thr_ramp", x, sr, PIN + sets("level_amount=1") + ["--ramp", "gate_thr=-80..0@0-20"])
         tw, gw = window_gain(a, z, sr)
         audible = np.array([np.sum(z[int(t * sr):int(t * sr) + int(0.002 * sr)] ** 2) > 1e-14 for t in tw])
-        top = float(gw[audible].max())
+        top = float(gw[audible].max()) if audible.any() else float("inf")
         rows["f_thr_ramp"] = {"max_gain_db": round(top, 3), "faults": st.get("faults"), "non_finite": st.get("non_finite")}
         ok = ok and top <= 6.01 and int(st.get("faults", "1")) == 0 and int(st.get("non_finite", "1")) == 0
         # (g) A preset change keeps the measurement: Init at +4.5 dB, then Rap Lead at +4 dB + its OUTPUT, no relearn.
