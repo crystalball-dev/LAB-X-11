@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 #include "Align.h"
 #include "Common.h"
@@ -137,9 +138,10 @@ namespace lab::dsp
             }
         }
 
-        // n gains (linear, floor .. 1) from n samples of the undelayed key; voice (optional) receives 1 while the
-        // gate is Open or in Hold, 0 otherwise. The audio is not touched.
-        void computeGain (const float* keyL, const float* keyR, float* gainOut, float* voice, int n) noexcept
+        // n gains (linear, floor .. 1) from n samples of the undelayed key. stateOut (optional) receives the state after
+        // each sample's update (State as uint8_t: 0 Closed, 1 Attack, 2 Open, 3 Hold, 4 Release), index-aligned with the
+        // gain: the level matcher reads it as its voice flag (docs/SPEC_LEVEL_MATCHER.md L.4). The audio is not touched.
+        void computeGain (const float* keyL, const float* keyR, float* gainOut, uint8_t* stateOut, int n) noexcept
         {
             fresh = false;
             for (int i = 0; i < n; ++i)
@@ -190,8 +192,8 @@ namespace lab::dsp
                     state = State::closed;
 
                 gainOut[i] = (float) gain;
-                if (voice != nullptr)
-                    voice[i] = (state == State::open || state == State::hold) ? 1.0f : 0.0f;
+                if (stateOut != nullptr)
+                    stateOut[i] = (uint8_t) state;
             }
         }
 
@@ -287,12 +289,13 @@ namespace lab::dsp
 
         struct Run
         {
-            std::vector<float> gain, voice, key;
+            std::vector<float> gain, key;
+            std::vector<uint8_t> states;
             std::vector<int> state;
         };
 
         // Runs a gate over a mono signal (duplicated to both channels), calling set() before every block as the base
-        // calls control(), recording gain, voice, key and state per sample. `change` may edit the settings per block.
+        // calls control(), recording gain, the state output, key and state per sample. `change` may edit the settings per block.
         auto run = [] (double sampleRate, const std::vector<float>& x, Settings s, int block, auto change)
         {
             VocalGate g;
@@ -301,7 +304,7 @@ namespace lab::dsp
             Run out;
             const int total = (int) x.size();
             out.gain.resize ((size_t) total);
-            out.voice.resize ((size_t) total);
+            out.states.resize ((size_t) total);
             out.key.resize ((size_t) total);
             out.state.resize ((size_t) total);
             for (int pos = 0; pos < total; pos += block)
@@ -312,7 +315,7 @@ namespace lab::dsp
                 for (int i = 0; i < n; ++i)
                 {
                     const int k = pos + i;
-                    g.computeGain (x.data() + k, x.data() + k, out.gain.data() + k, out.voice.data() + k, 1);
+                    g.computeGain (x.data() + k, x.data() + k, out.gain.data() + k, out.states.data() + k, 1);
                     out.state[(size_t) k] = (int) g.getState();
                     out.key[(size_t) k] = g.keyDb();
                 }
@@ -563,7 +566,7 @@ namespace lab::dsp
             report.add ("g9_block_equivalence", (double) worst, worst <= 0.0f);
         }
 
-        // G9b: RANGE 0 with control blocks of 1 and 7 samples: the gate still reaches Open and reports voice.
+        // G9b: RANGE 0 with control blocks of 1 and 7 samples: the gate still reaches Open and its state output says so.
         {
             Settings s;
             s.rangeDb = 0.0f;
@@ -572,7 +575,7 @@ namespace lab::dsp
             for (const int block : { 1, 7 })
             {
                 const auto r = run (48000.0, x, s, block, none);
-                ok = ok && r.state.back() == openS && r.voice.back() >= 1.0f;
+                ok = ok && r.state.back() == openS && r.states.back() == (uint8_t) S::open;
             }
             report.add ("g9b_range_zero_small_blocks_open", ok ? 1.0 : 0.0, ok);
         }

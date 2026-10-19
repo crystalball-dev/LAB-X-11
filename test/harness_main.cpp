@@ -391,9 +391,25 @@ namespace
         std::cout << "selftest_delay_mono=" << mono << " selftest_delay_stereo=" << stereo << std::endl;
         // LAB X-11's own DSP headers (T0): every case prints selftest_<case>=<value> and selftest_<case>_ok=<0|1>.
         lab::dsp::SelfTestReport report;
-        report.merge (lab::dsp::TransientAlign::selfTest());
-        report.merge (lab::dsp::VocalGate::selfTest());
-        report.merge (lab::dsp::LevelMatcher::selfTest());
+        {
+            juce::ScopedNoDenormals noDenormals;   // as on the audio thread
+            report.merge (lab::dsp::TransientAlign::selfTest());
+            report.merge (lab::dsp::VocalGate::selfTest());
+            report.merge (lab::dsp::LevelMatcher::selfTest());
+        }
+        // L31: LevelMatcher::defaults (used before the first control()) equal the level_* rows of the parameter table.
+        {
+            auto in = makeInstance (48000.0, 512, 120.0, true);
+            const auto& specs = in.fx->getSpecs();
+            int first = -1;
+            for (int i = 0; i < (int) specs.size(); ++i)
+                if (juce::String (specs[(size_t) i].id) == "level_amount")
+                    first = i;
+            bool same = first >= 0 && first + lab::dsp::LevelMatcher::paramCount <= (int) specs.size();
+            for (int k = 0; same && k < lab::dsp::LevelMatcher::paramCount; ++k)
+                same = std::abs (specs[(size_t) (first + k)].defaultValue - lab::dsp::LevelMatcher::defaults[k]) <= 0.0f;
+            report.add ("level_defaults", same ? 1.0 : 0.0, same);
+        }
         std::cout << report.text << "selftest_cases=" << report.cases << " selftest_failures=" << report.failures << std::endl;
         return (mono < 1.0e-4f && stereo < 1.0e-4f && report.failures == 0) ? 0 : 1;
     }
