@@ -528,4 +528,22 @@ instrumental ratio and drum-hit levels) and the independent re-measurement verdi
 
 ## Execution log
 
-(empty until the plan is approved)
+Executed on request (2026-10-18 to 2026-10-19) in a cloud session on branch `claude/task-4jz9sq`. The Windows machine,
+`F:\_DEV` and FL Studio were not reachable from it, so the build ran on Linux against JUCE 9.0.3 (cloned) and the X-16
+base cloned read-only from github.com/crystalball-dev/lab-x-16. `docs/DESIGN.md` has the details and the test table.
+
+- **Specs.** `docs/SPEC_LOOKAHEAD_GATE_AND_ALIGNMENT.md` (gate and alignment; reviewed before code, revision 3 records
+  the build) and `docs/SPEC_LEVEL_MATCHER.md` (the matcher, from a design panel; its implementation record wins over
+  its text). They fill sections 2.2, 3 and 4 marked PENDING above.
+- **M0 scaffold.** The X-16 base ported into the tree of 2.1 with the LABX16 -> LABX11 renames; one `juce_add_plugin`
+  (`Lb11`, Fx Dynamics) plus `LabX11Render`; the three scripts. Builds clean; C1-C3 pass.
+- **M1 gate.** `Gate.h`, `Align.h`, 33 self-tests. A three-lens review with two refuters per finding found a click on
+  every preset change (the 5 ms fade-in equals the 5 ms lookahead) and a hold shortened by the lookahead, among eight
+  defects; all fixed, each with a test that fails without the fix.
+- **M2 matcher.** `Leveler.h` + `LevelerSelfTest.h`, 125 self-tests reproducing the design prototype to the digit. One
+  change from its spec: the 20 ms voicing test at +3.5 dB (breathy voice admitted on 66 % of hops, breath noise on
+  none).
+- **M3.** The eight presets of 5.4 (no OUTPUT trims needed, P1), the editor, T7-T13 render tests, the editor PNG.
+- **Verification.** `run_tests.py --all`: 24 of 24 (C1-C9 with pluginval 5 and 10, T0-T13, P1).
+- **Still open:** section 5.2 / 5.3 / Appendix B stem measurements (THRESHOLD and TARGET defaults stay PROVISIONAL);
+  the FL checks F-A to F-E on Windows; decisions D7 and D8 (as built, see `docs/DESIGN.md`) and D9 naming for the user.
