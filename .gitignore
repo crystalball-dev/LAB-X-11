@@ -1,0 +1,28 @@
+# Build output
+build/
+build-*/
+out/
+test/out/
+__pycache__/
+*.pyc
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Audio never goes into this repository: every test signal is synthesized.
+*.ogg
+*.wav
+*.flac
+*.mp3
+*.aif
+*.aiff
+*.m4a
+*.opus
+*.wv
+*.wem
+
+# Host projects
+*.flp
