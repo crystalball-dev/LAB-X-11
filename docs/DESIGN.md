@@ -10,7 +10,8 @@ decisions as built, and the test results, as the sibling LAB X- repositories do.
 The plan's machine (Windows, VS 2022, FL Studio 20.6.2) was not reachable from the session that built 0.1.0, so it was
 built and tested on Linux: Ubuntu 24.04, GCC 13.3, CMake 3.28 with Ninja, JUCE 9.0.3 (the version the handoff names),
 pluginval 1.0.4, Python 3.13 with numpy 2.5 and scipy 1.18. The Windows scripts (`scripts/*.ps1`) follow the siblings'
-shape and are untested in this round. The FL Studio checks (handoff 4.3) are pending: they need the Windows machine.
+shape; they were untested in that round, and `build.ps1` has since built the plugin on Windows ("Windows verification"
+below). The FL Studio checks (handoff 4.3) are pending.
 
 ## M0: the scaffold on the LAB X-16 base
 
@@ -84,7 +85,8 @@ upheld nine findings and refuted six.
 
 ## M3: presets, editor, tests
 
-- **Presets** follow handoff 5.4. Every preset writes TARGET -18 and LAW Ride. With the reference vocal at TARGET, every
+- **Presets** follow handoff 5.4. Every preset writes TARGET -30 (since the review below; -18 PROVISIONAL in the first
+  build) and LAW Ride. With the reference vocal at TARGET, every
   preset keeps its loudness within 0.05 dB at OUTPUT 0 dB, so no preset carries an OUTPUT trim (P1).
 - **Editor**: the X-16 engine, 960 x 560, Oxide. Row 1: GATE and METERS (gate lamp, KEY / THRESHOLD, gate needle, voice
   lamp, LEVEL / TARGET, match needle). Row 2: DETECTOR, LEVEL, OUTPUT. `docs/labx11-ui.png` is the harness's render.
@@ -100,9 +102,9 @@ upheld nine findings and refuted six.
 | D3 | Identity | `LAB X-11`, `Lb11`, `com.operationfairway.labx11`, Fx Dynamics, 0.1.0, as proposed |
 | D4 | Lookahead | 5 ms fixed: 221 / 240 / 480 samples at 44.1 / 48 / 96 kHz |
 | D5 | Sidechain | none |
-| D6 | Default threshold | -40 dB, the DD Gate reading; **provisional** until the stem measurements |
+| D6 | Default threshold | -40 dB, the DD Gate reading; validated on eight reference takes (no audible vocal or word tail lost, room tone down 14 to 23 dB). A take recorded about 40 dB low needs it lowered (README) |
 | D7 | Matcher law | Ride (continuous) by default and in every preset; Step (1.5 dB grid, set at phrase onsets) as a choice. **Please confirm** |
-| D8 | Matcher target | a fixed TARGET, -18 **provisional**. Its meaning is amended from "dBFS short-term" to "LUFS of the voiced vocal, momentary": set it from the LEVEL readout. **Please confirm** |
+| D8 | Matcher target | a fixed TARGET, -30: the median voiced loudness of the reference lead takes (was -18 provisional). Its meaning is amended from "dBFS short-term" to "LUFS of the voiced vocal, momentary": set it from the LEVEL readout. **Please confirm** |
 | D9 | Names | panel titles and preset names as proposed; **yours to change** (nothing depends on them) |
 | D10 | Unit tests | `selfTest()` in the DSP headers, printed by `--selftest` and asserted as T0, as proposed |
 | D11 | Theme | Oxide (Deep Zone), 960 x 560 |
@@ -110,6 +112,19 @@ upheld nine findings and refuted six.
 Open from the matcher design for your decision: the periodicity voicing test (above), which would reject room rumble
 and ride breathy delivery as eagerly as clean singing; and whether a later version should link doubles' TARGET to the
 lead (it is copied by hand in 0.1.0).
+
+Open from the review on Windows (below), also yours:
+
+- **Breaths.** At the defaults loud breaths pass at full level and quieter breath noise is lowered with the room tone.
+  Reducing loud breaths too (the brief asks for a gate "tuned for vocal breaths and room tone between phrases") needs a
+  higher THRESHOLD, with the risk to soft word starts, or a breath-aware mode keyed on the matcher's voicing test.
+  Neither is in 0.1.0.
+- **Pre-level floor at TARGET -30.** With a misset gate, hum before the first line now forms the first level at Init:
+  +4.2 dB on the hum and on the first seconds of voice (spec M12). The -10 dB floor of spec O-17 would close this, at
+  the cost O-17 lists.
+- **A lookahead mode for the matcher.** The causal rider narrows the line-to-line spread of the reference takes by 11
+  to 30 % on most of them. Knowing each line's level before it plays (a 1 to 2 s lookahead, compensated by FL at the
+  price of latency) is an option under study.
 
 ## Verification, Linux build, 2026-10-19
 
@@ -131,6 +146,43 @@ lead (it is copied by hand in 0.1.0).
 | T7-T12 matcher | +12.00 dB from -30 dBFS in 2.89 s at every rate; limits exact; gain frozen through gaps (0.0 dB pp); bursts move it under 0.012 dB; takes 12 dB apart land 1.2 dB apart; breaths and hold tails ignored (an abrupt breath right after a word moves it at most 0.004 dB); Gate Only bit-exact; no added latency |
 | T13 preset switch on a vocal-level tone | no step above the tone's own, no dip |
 | P1 loudness | every preset within 0.05 dB |
+
+## Windows verification and the reference takes, 2026-10-19
+
+A review on the plan's own machine (Windows 11, VS 2022 Build Tools with MSVC 14.44, CMake 4.4.4, JUCE 9.0.3,
+pluginval, Python 3.14 with numpy 2.5 and scipy 1.18) built this branch with `scripts/build.ps1` and ran the suite.
+
+| Run | Build | `--selftest` | `run_tests.py --all` |
+|---|---|---|---|
+| The Linux-verified commit (93c40ab) | clean, 0 warnings, 144 s | 179 of 179 | 24 of 24, pluginval 5 and 10 included |
+| After the TARGET change below | clean, 0 warnings | 179 of 179 | 24 of 24 |
+
+C8 reads 480 times real time for every preset on Windows. Thread CPU time there has a 15.6 ms resolution, so that
+figure is the clock's floor, not a measurement; the margin over the 20 times requirement is large either way.
+
+**Found, not fixed: the readout headers are cut off on Windows.** The editor draws in Consolas there, wider than the
+font the Linux render fell back to, so the KEY and LEVEL readouts show "KEY THR -40…" and "LUFS TGT -3…" instead of
+the full threshold and target (visible in `docs/labx11-ui.png`, now the Windows render). The knobs below still show
+both values. Shorter header text or a smaller header font would fix it; C9 does not check it.
+
+The reference takes, out of reach of the first build's machine, were measured: the first five minutes of nine raw
+takes from the three projects, rendered through `LabX11Render` (handoff 5.3 has the method and the per-take figures).
+What changed the build or the docs:
+
+- **TARGET -30.** The takes' voiced loudness has a median of -30 LUFS, so the provisional -18 kept the matcher at MAX
+  BOOST: a flat +4.5 dB, no line evening. TARGET's default (the parameter table and `LevelMatcher::defaults`) is now
+  -30, in every preset. The self-tests and the render tests' PIN keep -18, so their figures stand; T11's Rap Lead
+  render and T12(g) place their signals relative to the preset TARGET (spec M12).
+- **THRESHOLD -40 validated.** On eight normally recorded takes the gate at its defaults lost 0.03 dB or less of vocal
+  and word-tail energy and took the room tone down 14 to 23 dB. A ninth take, recorded about 40 dB low, loses most of
+  its words at -40 dB; the README now says the defaults assume a normal recording level.
+- **Breaths.** Loud breaths pass and most quieter breath noise is lowered. The README said breaths pass; it now says
+  what the takes showed.
+- **The matcher on real delivery.** With TARGET at each take's level the line-to-line spread shrinks 11 to 30 % on most
+  takes (from 1 to 49 %), the causal limit of spec O-9. The README now says so.
+- **README.** The real-vocal render command now passes `--level 0`, `--seconds` and `--sr` (the harness defaults are
+  -12 dB and 4 s). Added: the ride runs in voiced time; a take about 25 dB or more quieter than the learned level is not
+  measured; Step also commits inside a line after 4 s of voice; FL labels TARGET in dB.
 
 ## FL Studio checks (handoff 4.3): pending
 

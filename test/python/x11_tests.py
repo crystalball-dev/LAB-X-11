@@ -40,7 +40,7 @@ def latency_for(sr):
 # is 0 dB in every preset and the OUTPUT trims answer for the gate alone (docs/SPEC_LEVEL_MATCHER.md L.14).
 
 def preset_target():
-    """level_target's default in plugins/x11/LabX11.cpp: every preset writes it (-18 PROVISIONAL)."""
+    """level_target's default in plugins/x11/LabX11.cpp: every preset writes it (-30, the reference takes' median)."""
     text = (ROOT / "plugins" / "x11" / "LabX11.cpp").read_text(encoding="utf-8")
     return float(re.search(r'\{ "level_target",[^,]+,[^,]+,\s*(-?[\d.]+)f,\s*(-?[\d.]+)f,\s*(-?[\d.]+)f', text).group(3))
 
@@ -207,7 +207,8 @@ def x11_tests(h, record, want):
 # The level matcher: T7-T12 of docs/SPEC_LEVEL_MATCHER.md L.13.
 #
 # Every render starts from PIN, the PROVISIONAL / D6 values these figures were measured at, so a later default
-# cannot silently move a T figure; a test's own --set (later on the command line) wins. Renders that load a program
+# cannot silently move a T figure (the shipped TARGET default moved to -30 after the stem measurements; PIN keeps
+# -18 on purpose); a test's own --set (later on the command line) wins. Renders that load a program
 # take no PIN. Renders are trimmed by the latency, so output sample i lines up with input sample i.
 
 PIN = sets("level_target=-18", "gate_thr=-40", "gate_hyst=4")
@@ -551,33 +552,38 @@ def matcher_tests(h, record, want):
         # Part B: alternating phrase levels; the spread of each phrase's second half, phrases 3-12.
         levels = [-18, -24, -12, -21, -15, -24, -13, -19, -22, -14, -18, -25]
         x, spans = phrase_train(sr, levels, 12)
-        def halves(out):
+        # Rap Lead loads its own TARGET (the preset default: -30 since the stem measurements, docs/SPEC_LEVEL_MATCHER.md
+        # M12), so it gets the same phrases centred on that TARGET. Phrase lengths come from the seed alone, so the spans
+        # match; the spread, not the level, is compared.
+        x_rap, spans_rap = phrase_train(sr, [v + preset_target() - TARGET for v in levels], 12)
+        def halves(out, sp):
             vals = []
-            for s, e in spans[2:]:
-                mask = np.zeros(len(x), bool)
+            for s, e in sp[2:]:
+                mask = np.zeros(len(out), bool)
                 mask[(s + e) // 2:e] = True
                 vals.append(k_loudness(out, sr, mask))
             return float(np.std(vals))
-        def wholes(out):
+        def wholes(out, sp):
             vals = []
-            for s, e in spans[2:]:
-                mask = np.zeros(len(x), bool)
+            for s, e in sp[2:]:
+                mask = np.zeros(len(out), bool)
                 mask[s:e] = True
                 vals.append(k_loudness(out, sr, mask))
             return float(np.std(vals))
-        sd_in = halves(x)
-        outs = {"default": render_in(h, "t11b_default", x, sr, PIN)[0],
-                "amount1": render_in(h, "t11b_amount1", x, sr, PIN + sets("level_amount=1"))[0],
-                "rap_lead": render_in(h, "t11b_rap_lead", x, sr, ["--program", "3"])[0]}
+        sd_in = halves(x, spans)
+        sd_in_rap = halves(x_rap, spans_rap)
+        outs = {"default": (render_in(h, "t11b_default", x, sr, PIN)[0], spans, sd_in),
+                "amount1": (render_in(h, "t11b_amount1", x, sr, PIN + sets("level_amount=1"))[0], spans, sd_in),
+                "rap_lead": (render_in(h, "t11b_rap_lead", x_rap, sr, ["--program", "3"])[0], spans_rap, sd_in_rap)}
         need = {"default": 0.20, "amount1": 0.30, "rap_lead": 0.50}
-        b = {"input_sd": round(sd_in, 2), "input_whole_sd": round(wholes(x), 2)}
-        for k, o in outs.items():
-            sd = halves(o)
+        b = {"input_sd": round(sd_in, 2), "input_whole_sd": round(wholes(x, spans), 2), "rap_lead_input_sd": round(sd_in_rap, 2)}
+        for k, (o, sp, ref) in outs.items():
+            sd = halves(o, sp)
             b[k + "_sd"] = round(sd, 2)
-            b[k + "_whole_sd"] = round(wholes(o), 2)
-            ok = ok and (sd_in - sd) / sd_in >= need[k]
+            b[k + "_whole_sd"] = round(wholes(o, sp), 2)
+            ok = ok and (ref - sd) / ref >= need[k]
         z, _ = render_in(h, "t11b_zero", x, sr, PIN + sets("level_amount=0"))
-        g = sample_gain(outs["default"], z)
+        g = sample_gain(outs["default"][0], z)
         mask = np.zeros(len(x), bool)
         for s, e in spans:
             mask[s:e] = True
@@ -781,7 +787,9 @@ def matcher_tests(h, record, want):
         rows["f_thr_ramp"] = {"max_gain_db": round(top, 3), "faults": st.get("faults"), "non_finite": st.get("non_finite")}
         ok = ok and top <= 6.01 and int(st.get("faults", "1")) == 0 and int(st.get("non_finite", "1")) == 0
         # (g) A preset change keeps the measurement: Init at +4.5 dB, then Rap Lead at +4 dB + its OUTPUT, no relearn.
-        x = tone(sr, 12.0, -30.0)
+        # The tone sits 6 dB under the presets' TARGET (-36 dBFS at the -30 default, M12), so both presets ride to their
+        # boost limit, and above both presets' THRESHOLD (-40 / -38 dB), so the gate stays open.
+        x = tone(sr, 12.0, preset_target() - 6.0)
         out, st = render_in(h, "t12g_switch", x, sr, ["--program", "0", "--program-at", "3@8.0"])
         t, g = sine_gain_bins(out, x, sr)
         g_init = float(np.nanmedian(g[(t >= 7.5) & (t < 7.9)]))

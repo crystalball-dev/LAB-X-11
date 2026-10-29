@@ -91,7 +91,7 @@ Steady state (Ride, A constant, inside the limits): output voiced loudness = L +
 
 ### L.3 Target (D8)
 
-**TARGET is a fixed per-song parameter, `level_target`, with no auto-learn.** Default −18 PROVISIONAL.
+**TARGET is a fixed per-song parameter, `level_target`, with no auto-learn.** Default −30, the median voiced loudness of the reference lead takes (M12; the first build shipped −18 PROVISIONAL).
 
 What it means:
 - The voiced BS.1770 momentary loudness: 400 ms, K-weighted, L+R power sum, −0.691 offset.
@@ -102,7 +102,7 @@ What it means:
 
 Procedure for the README: "play a typical verse, read LEVEL (meter slot 3), set TARGET to it". The average correction is then about 0 dB, so the vocal-to-snare fader balance and the gain into the user's −30 dB compressors are unchanged. Only the spread changes.
 
-The −18 default will be replaced by the median voiced momentary loudness of the three lead stems, rounded to 1 dB, in every preset at once.
+Done in M12: the median voiced loudness of the reference lead takes, rounded to 1 dB, is −30, and every preset carries it.
 
 ### L.4 Detector
 
@@ -158,7 +158,7 @@ The −18 default will be replaced by the median voiced momentary loudness of th
       - It rejects hum and tonal bleed, which pass the voicing test, **only when they sit at least about 25 dB under the window** (L.5).
     - **Pre-level floor** (before the first level exists): −0.691 + 10·log₁₀(ms) ≥ T − B − 20 dB, i.e. no more than 20 dB under the quietest level the ride could fully correct.
       - Without it, with a misset gate, hum or bleed before the first phrase (song intro, after `prepareToPlay`, after a fault) fills the window in 100 ms. The ride then climbs to MAX BOOST on the hum itself (+4.5 dB applied at Init). When the voice arrives about 35 dB louder, the burst clamp throttles acquisition.
-      - The L23 / T12b hum (−54.7 LUFS) is rejected whenever T − B > −34.7, which covers every preset at TARGET −18 (L30, T12(b″)).
+      - The L23 / T12b hum (−54.7 LUFS) is rejected whenever T − B > −34.7, which covered every preset at TARGET −18 (L30, T12(b″); both pin −18). At the shipped −30 it covers only Room Tone and Rap Lead: at Init, Booth Floor, Soft Take, Ad-lib / Double and Level Only a misset gate lets that hum form the first level (M12).
   - `admitting` = the result.
   - **Burst clamp** (once a level exists): an admitted hop is capped at 10·gatedMean (+10 dB).
     - The clamp is self-referential, because gatedMean is the mean of hops that were already capped. At +6 dB, that feedback settled low on staccato syllables. LEVEL then read low, and the matcher boosted staccato lines more than legato lines of equal loudness.
@@ -296,7 +296,7 @@ These rows are appended after the gate's nine rows (SPEC 4.4), in this order. Th
 | id | name | kind | min | max | default | skewCentre | smooth | unit | choices | notes |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `level_amount` | Amount | real | 0 | 1 | **0.75** | 0 | linear | % | | 0 = bit-exact off (preset Gate Only); < 1e−4 is treated as 0. Scales the ride including its limits. Linear because the log smoother clamps at 1e−4. Applied changes are slew-capped at 12 dB/s |
-| `level_target` | Target | real | −40 | −6 | **−18 PROVISIONAL** | 0 | linear | dB | | D8 (amended, O-2): voiced BS.1770 momentary loudness (LUFS, L+R). Set from the LEVEL readout, not from Youlean. Max −6 keeps vocal peaks (crest 15–20 dB) near the +12 dBFS wet-safety knee |
+| `level_target` | Target | real | −40 | −6 | **−30** (M12) | 0 | linear | dB | | D8 (amended, O-2): voiced BS.1770 momentary loudness (LUFS, L+R). Set from the LEVEL readout, not from Youlean. Max −6 keeps vocal peaks (crest 15–20 dB) near the +12 dBFS wet-safety knee |
 | `level_time` | Ride Time | real | **0.5** | 10 | 1 | 1 | log | s | | τ in voiced time; max rate 6/τ dB/s (12 dB/s at the minimum, outside the compressors' syllable territory) |
 | `level_boost` | Max Boost | real | 0 | 18 | 6 | 0 | linear | dB | | Upper clamp on the goal. Boost is the risky direction (it lifts the in-phrase floor), so it is smaller than the cut. Also sets the pre-level floor (TARGET − MAX BOOST − 20 dB) |
 | `level_cut` | Max Cut | real | 0 | 18 | 9 | 0 | linear | dB | | Lower clamp on the goal, entered as positive dB. Cutting is the safe direction; the compressors handle the rest |
@@ -569,7 +569,7 @@ Harness:
 - **Sample indices are 0-based**, counted from the first sample after the last `reset()` / `prepare()`.
 - State arrays are synthesised: 2 = Open where voiced, 0 = Closed elsewhere.
 - Sine = peak·sin(2πft/sr), computed in double, L = R. Rng = `lab::dsp::Rng`.
-- **C** = {1, −18, 1, 18, 18, law}; **D** = defaults.
+- **C** = {1, −18, 1, 18, 18, law}; **D** = {0.75, −18, 1, 6, 9, 0}, the first build's defaults (the shipped TARGET is −30 since M12).
 - **VOICE(seed, scale)** = Σ_{h=1..24, 140h < 0.45·sr} sin(2π·140h·t + φ_h)/h, with φ_h = 2π·Rng(seed).uni() drawn for h = 1..24, times a 5 Hz syllable envelope 10^(−5(1 − cos 2π·5t)/20) (0 to −10 dB), times 0.25·scale. VOICE(·, 10^(−6/20)) reads −20.486 LUFS for any seed.
 - Reference instances (L28, L29) are copies with the named test switch set to +∞.
 - Expected values come from the prototype (g++ 13.3) unless marked emulation, hop model or rough emulation. Non-exact values are re-baselined once on the MSVC `/fp:precise` build. "==" cases are structural and must hold on any build.
@@ -617,7 +617,7 @@ Harness:
 Shared method:
 - Signals are generated with numpy, written as 32-bit float WAVs to `test/out/`, and rendered with `--in`.
 - Latency is L = `int (sr * 0.005 + 0.5)`.
-- **Pinned settings.** Every render starts from PIN = `--set level_target=-18 --set gate_thr=-40 --set gate_hyst=4`, the PROVISIONAL / D6 values these figures were measured at. Replacing a default later then cannot silently move a T figure.
+- **Pinned settings.** Every render starts from PIN = `--set level_target=-18 --set gate_thr=-40 --set gate_hyst=4`, the PROVISIONAL / D6 values these figures were measured at. Replacing a default later then cannot silently move a T figure (M12 replaced TARGET's default with −30; PIN keeps −18).
   - A test's own `--set` replaces the PIN entry with the same id.
   - Renders that load a program (`--program`) take no PIN, and neither does T12(e)'s reference render. They test the preset's or the defaults' own values.
 - **Two-render matcher gain:** g(t) = 10·log₁₀(ΣA²/ΣZ²) over 2 ms windows, where Z is the same render with `--set level_amount=0`. The gate does not depend on the matcher, and renders are deterministic.
@@ -685,7 +685,7 @@ Shared method:
 - **Part B, alternating phrases.** 12 phrases at −18 / −24 / −12 / −21 / −15 / −24 / −13 / −19 / −22 / −14 / −18 / −25 (seed 12). Take the SD of the K-loudness of the **second half of each phrase**, phrases 3–12:
   - falls ≥ 20 % at PIN defaults (4.48 → 3.16°);
   - falls ≥ 30 % with PIN `--set level_amount=1` (2.80°);
-  - falls ≥ 50 % with `--program 3` (1.79°).
+  - falls ≥ 50 % with `--program 3` (1.79°). Since M12 Rap Lead loads TARGET −30, so its render gets the same phrases shifted by its TARGET minus −18 (−12 dB), centred on its own TARGET (Windows build: 4.46 → 1.79).
   - Matcher gain band-passed 2–8 Hz ≤ 0.5 dB pp on phrase samples (0.10 / 0.13 / 0.25°).
   - The whole-phrase SD is reported, not asserted (4.43 → 4.37°; see O-9).
 - **T11c, breathy delivery (Soft Take).**
@@ -721,7 +721,7 @@ Shared method:
 - (d′) **Abrupt breaths.** As (d), with each breath given a 10 ms linear rise and no swell, rel = −10 / −15: \|g_breath − g_ref\| at every onset of phrases 2–6 ≤ 0.1 dB (emulation ≤ 0.004).
 - (e) **Gate Only.** `--program 6` against `--set level_amount=0` (neither with PIN): identical renders (max \|diff\| == 0). On the T7 signal, out == the delayed input after the gate attack.
 - (f) **Threshold ramp.** `--ramp gate_thr -80..0` over 20 s on a 27 s phrase train (−26 / −14 / −21 × 4 LUFS), PIN `--set level_amount=1`, level_boost constant: no fault, all samples finite, matcher gain ≤ level_boost + 0.01 (5.51°).
-- (g) **Preset switch keeps the measurement.** T7 signal at 48 kHz, `--program 0 --program-at 8.0 3`:
+- (g) **Preset switch keeps the measurement.** 997 Hz at 6 dB under the presets' TARGET (the T7 signal while TARGET was −18; −36 dBFS since M12, above both presets' THRESHOLD), 48 kHz, `--program 0 --program-at 8.0 3`:
   - sine gain over 7.5–7.9 s = 4.50 ± 0.05 (Init: ride at its +6 limit × 0.75; Init's `output` is 0 dB);
   - over 8.05–9.0 s = 4.00 + output₃ ± 0.05, where output₃ is Rap Lead's P1-trimmed `output`, read from the preset table in `LabX11.cpp` (Rap Lead: A 1 × min(ride, 4), with no relearn from 0 dB). The sine gain includes OUTPUT, and a two-render reference does not work across `--program-at`, because the preset rewrites `level_amount`;
   - C4's jump < 0.5 still holds.
@@ -734,21 +734,21 @@ Notes for the C tests:
 
 ### L.14 Presets (matcher rows; gate rows belong to the gate design)
 
-Every preset writes `level_law` = Ride (0) and `level_target` = −18 (PROVISIONAL). Loading a preset therefore resets TARGET (O-7). For doubles, "same target" is the user's step: after loading Ad-lib / Double, copy the lead instance's TARGET into this instance. There is no link in 0.1.0 (D2 / D5).
+Every preset writes `level_law` = Ride (0) and `level_target` = −30 (M12; −18 PROVISIONAL in the first build). Loading a preset therefore resets TARGET (O-7). For doubles, "same target" is the user's step: after loading Ad-lib / Double, copy the lead instance's TARGET into this instance. There is no link in 0.1.0 (D2 / D5).
 
 | # | Preset | amount | target | time | boost | cut | law | intent (handoff 5.4) |
 |---|---|---|---|---|---|---|---|---|
-| 0 | Init | 0.75 | −18 | 1.0 s | 6 | 9 | Ride | gentle matcher (the defaults) |
-| 1 | Booth Floor | 0.75 | −18 | 2.0 s | 6 | 9 | Ride | on, slow |
-| 2 | Room Tone | 0.60 | −18 | 1.5 s | 3 | 9 | Ride | moderate; little boost, so a noisy take's in-phrase floor is not lifted |
-| 3 | Rap Lead | 1.00 | −18 | 0.5 s | 4 | 6 | Ride | faster, tighter limits; shouts and whispers keep their intent beyond +4/−6 |
-| 4 | Soft Take | 0.75 | −18 | 1.0 s | 12 | 6 | Ride | more boost allowed (applied max +9). Whispered lines (HNR near 0 dB) fail voicing and hold their gain (T11c, L32) |
-| 5 | Ad-lib / Double | 1.00 | −18 | 0.5 s | 6 | 9 | Ride | on; A = 1 lands the double on TARGET, so copy the lead's TARGET into this instance after loading. The insert fader sets the double's 26–60 % offset |
-| 6 | Gate Only | 0.00 | −18 | 1.0 s | 6 | 9 | Ride | matcher off: bit-exact from the preset's fade-in (the base resets smoothers at flush, and the snap sets amountNow = 0) |
-| 7 | Level Only | 0.75 | −18 | 1.0 s | 6 | 9 | Ride | matcher defaults; gate_range 0 on the gate side, while THRESHOLD still detects voice |
+| 0 | Init | 0.75 | −30 | 1.0 s | 6 | 9 | Ride | gentle matcher (the defaults) |
+| 1 | Booth Floor | 0.75 | −30 | 2.0 s | 6 | 9 | Ride | on, slow |
+| 2 | Room Tone | 0.60 | −30 | 1.5 s | 3 | 9 | Ride | moderate; little boost, so a noisy take's in-phrase floor is not lifted |
+| 3 | Rap Lead | 1.00 | −30 | 0.5 s | 4 | 6 | Ride | faster, tighter limits; shouts and whispers keep their intent beyond +4/−6 |
+| 4 | Soft Take | 0.75 | −30 | 1.0 s | 12 | 6 | Ride | more boost allowed (applied max +9). Whispered lines (HNR near 0 dB) fail voicing and hold their gain (T11c, L32) |
+| 5 | Ad-lib / Double | 1.00 | −30 | 0.5 s | 6 | 9 | Ride | on; A = 1 lands the double on TARGET, so copy the lead's TARGET into this instance after loading. The insert fader sets the double's 26–60 % offset |
+| 6 | Gate Only | 0.00 | −30 | 1.0 s | 6 | 9 | Ride | matcher off: bit-exact from the preset's fade-in (the base resets smoothers at flush, and the snap sets amountNow = 0) |
+| 7 | Level Only | 0.75 | −30 | 1.0 s | 6 | 9 | Ride | matcher defaults; gate_range 0 on the gate side, while THRESHOLD still detects voice |
 
 **P1 trim rule (explicit):**
-- Build the reference vocal fixture from voice phrases at K-loudness = the presets' common TARGET, read from the preset table (−18 PROVISIONAL), not a literal.
+- Build the reference vocal fixture from voice phrases at K-loudness = the presets' common TARGET, read from the preset table (−30 since M12), not a literal.
 - The matcher's settled gain is then 0 dB in every preset, so presets 1–5 trim only for the gate. Measure after the first 5 s.
 - For any other fixture level L_fix, the matcher's share is A·clamp(T − L_fix, −C, +B), or the settled step under Step. Set `output` = −(matcher share + gate share), rounded to 0.1 dB.
 - Presets 6 and 7 keep `output` at 0 dB.
@@ -758,7 +758,7 @@ Every preset writes `level_law` = Ride (0) and `level_target` = −18 (PROVISION
 | # | Point | Conservative default here | Alternative |
 |---|---|---|---|
 | O-1 | D7 law | Ride as the default and in every preset; Step opt-in (commit + pre-roll, fixed 1.5 dB grid, 1.0 dB commit, 4 s late commit, no extra ids) | if the user confirms the stepped reading, Booth Floor switches to Step with no id change |
-| O-2 | D8 TARGET: default and meaning | −18 LUFS PROVISIONAL, all presets. **D8 amendment for the user to confirm:** TARGET is voiced LUFS momentary, set from LEVEL, not D8's "dBFS short-term" (L.3) | default: the median voiced momentary loudness of the three lead stems (5.3 / Appendix B), rounded to 1 dB |
+| O-2 | D8 TARGET: default and meaning | −30 LUFS from the reference takes (M12), all presets. **D8 amendment for the user to confirm:** TARGET is voiced LUFS momentary, set from LEVEL, not D8's "dBFS short-term" (L.3) | the default rule (the median voiced loudness of the reference takes, rounded to 1 dB) is applied in M12 |
 | O-3 | Init AMOUNT | 0.75 (keeps a quarter of the line contour) | 0.5 ("robust"; halves the spread only) |
 | O-4 | Gate contract | `computeGain` emits a per-sample `uint8_t` state | per-block fallback, read after `computeGain` (block-end state): onsets and closes seen ≤ 15 samples early, pre-roll still before the onset audio, chain-level bit-exactness lost |
 | O-5 | Voicing test | 500 Hz band (Q 0.5) ≥ 6 kHz band (Q 0.5) + 6.02 dB over 20 ms, and + 3.01 dB in the hop, PROVISIONAL | check in M2 on the three lead stems with the lamp (custom[4] should read 1 for most sung time), and with L32 / T11c on breathy voice. False negatives are benign: the gain holds, and whispered lines keep their level. If a real voice fails, retune the constants, not the ids |
@@ -910,3 +910,4 @@ state). The self-test values reproduce the prototype's figures to the printed di
 | M9 | Meter slots: 0 gate lamp, 1 gate reduction, 2 match gain, 3 LEVEL (LUFS), 4 voice lamp, 5 key, 6 threshold | L.9's slots 2–4 kept; the gate's key and threshold readouts moved to 5–6 |
 | M10 | **Room rumble passes the voicing test** (review of M2) | The band-ratio test reads tilt only. Noise falling 6 dB per octave or more (brown, NC-30 HVAC curves, traffic) is admitted on about 100 % of hops at every rate, so with a misset gate it behaves like hum: held 30 dB under the voice, ridden toward MAX BOOST 20 dB under (L3 `voicing_brown_documented`, L23d). L.1, L.5, L.7 and the README are corrected. Not fixed in 0.1.0: the review's proposed periodicity test (normalised autocorrelation of the low band over 2.5-12.5 ms lags, prototype: brown 2.5 %, voice 100 %, breathy HNR 6 99 %) changes which hops of real vocals are admitted, which no synthetic test can validate; it is left as an option for the user (docs/DESIGN.md) |
 | M11 | Review of M2: eleven mutants of `Leveler.h` passed the whole suite | new cases L1b (one channel, anti-phase), L3 noise over 16 seeds, L8b (Hold, Release, Attack), L12 hold at -29.125 dBFS (commit hysteresis), L12b (Step re-triggered from Release), L20b (limit change under Step), L27b (flush under Step), L28b (burst clamp against plosive thumps); T12(d') rebuilt so only the per-hop voicing test can pass it; T0 pins its case counts. All eleven mutants now fail |
+| M12 | **TARGET default −30, from the reference takes** (review on Windows, 2026-10-19) | The first build shipped −18 PROVISIONAL because its build machine could not reach the stems. Measured on the first five minutes of eight raw lead takes (handoff 5.3), the voiced line loudness has per-take medians from −35.0 to −21.3 LUFS and a median of −30.0. At −18 the matcher sat at MAX BOOST on takes at −28 to −35 LUFS: a flat +4.5 dB at Init and no line evening. At −30 Init's median gain is near 0 dB on takes near −30, and the line SD falls 1–49 % (11–30 % on most takes). The self-tests pin −18, so their figures are unchanged; `defaults[]` and the parameter table move together (L31). T11 Part B's Rap Lead render and T12(g) now place their signals relative to the preset TARGET. Consequence: the pre-level floor at the defaults is now −56 dB (T − B − 20), so with a misset gate (THRESHOLD under the hum) the −54.7 LUFS hum forms the first level at Init. Measured on a real take after 3 s of that hum: the hum and the first 2 s of voice were boosted +4.2 dB, and the gain was within 0.7 dB of its hum-free value 12 s later. With THRESHOLD at its −40 dB default the gate keeps the hum out and nothing changes. O-17's alternative (a −10 dB floor) would remove this at the cost O-17 lists; it is left to the user |

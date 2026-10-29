@@ -57,16 +57,17 @@ namespace
                 { "det_release",  "Det Release", Kind::real,   1.0f,   200.0f,  20.0f,  20.0f,  Smooth::log,    "ms", "" },
                 // LEVEL // УРОВЕНЬ (docs/SPEC_LEVEL_MATCHER.md L.9; LevelMatcher::defaults must match, checked by L31)
                 { "level_amount", "Amount",      Kind::real,   0.0f,   1.0f,    0.75f,  0.0f,   Smooth::linear, "%",  "" },
-                { "level_target", "Target",      Kind::real,   -40.0f, -6.0f,   -18.0f, 0.0f,   Smooth::linear, "dB", "" },
+                { "level_target", "Target",      Kind::real,   -40.0f, -6.0f,   -30.0f, 0.0f,   Smooth::linear, "dB", "" },
                 { "level_time",   "Ride Time",   Kind::real,   0.5f,   10.0f,   1.0f,   1.0f,   Smooth::log,    "s",  "" },
                 { "level_boost",  "Max Boost",   Kind::real,   0.0f,   18.0f,   6.0f,   0.0f,   Smooth::linear, "dB", "" },
                 { "level_cut",    "Max Cut",     Kind::real,   0.0f,   18.0f,   9.0f,   0.0f,   Smooth::linear, "dB", "" },
                 { "level_law",    "Law",         Kind::choice, 0.0f,   1.0f,    0.0f,   0.0f,   Smooth::none,   "",   "Ride|Step" },
             };
             e.stages = { "gate", "level" };
-            // Handoff 5.4. Every preset writes TARGET -18 (PROVISIONAL, from the stem measurements later) and LAW Ride
-            // (D7). Gate rows are PROVISIONAL too. OUTPUT trims keep the reference vocal's RMS within 1 dB (test P1);
-            // Gate Only and Level Only stay at 0 dB (the X-16 rule for utility presets).
+            // Handoff 5.4. Every preset writes TARGET -30 (the median voiced loudness of the reference lead takes, handoff
+            // 5.3; was -18 PROVISIONAL in the first build) and LAW Ride (D7). Gate rows stay PROVISIONAL (their -40 dB
+            // THRESHOLD base is validated on the reference takes, handoff 5.3). OUTPUT trims keep the reference vocal's
+            // RMS within 1 dB (test P1); Gate Only and Level Only stay at 0 dB (the X-16 rule for utility presets).
             e.presets = {
                 { "Init", {} },
                 { "Booth Floor", { { "gate_thr", -42.0f }, { "gate_hold", 80.0f }, { "gate_release", 150.0f },

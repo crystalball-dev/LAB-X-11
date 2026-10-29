@@ -50,8 +50,9 @@ namespace lab::dsp
         static constexpr double gridDb = 1.5, commitDb = 1.0, lateSeconds = 4.0;
         static constexpr double log2PerDb = 0.16609640474436813;   // log2 (10) / 20
         static constexpr float noLevel = -100.0f;
-        // The parameter defaults: must equal the level_* rows of EffectInfo::params (checked by the harness, L31).
-        static constexpr float defaults[paramCount] = { 0.75f, -18.0f, 1.0f, 6.0f, 9.0f, 0.0f };
+        // The parameter defaults: must equal the level_* rows of EffectInfo::params (checked by the harness, L31). TARGET
+        // -30 is the median voiced loudness of the reference lead takes (handoff 5.3); the self-tests pin -18 explicitly.
+        static constexpr float defaults[paramCount] = { 0.75f, -30.0f, 1.0f, 6.0f, 9.0f, 0.0f };
 
         static int lookahead (double sr) noexcept { return std::max (1, (int) (sr * hopSeconds + 0.5)); }   // == TransientAlign::latency
 
@@ -355,7 +356,7 @@ namespace lab::dsp
         int64_t lateLen = 192000, lateCount = 0, hopsAdmitted = 0, hopsRejected = 0;
         double kSum = 0.0, loSum = 0.0, hiSum = 0.0, gatedMean = 0.0, levelLufs = -100.0;
         bool valid = false, admitting = false, wasPhrase = false, snapPending = false;
-        double sampleRate = 48000.0, targetDb = -18.0, boostDb = 6.0, cutDb = 9.0;
+        double sampleRate = 48000.0, targetDb = -30.0, boostDb = 6.0, cutDb = 9.0;
         double coef = 0.0, slew = 0.0, capPerSample = 0.00025, amountTarget = 0.75, amountNow = 0.75, preFloorMs = 0.0;
         double goalDb = 0.0, rideDb = 0.0, stepDb = 0.0, outDb = 0.0, appliedDb = 0.0, lastApplied = 0.0;
         double preFrom = 0.0, preTo = 0.0;

@@ -30,6 +30,8 @@ namespace lab::dsp
         static constexpr uint8_t openS = M::open, closedS = M::closed;
 
         static V settings (float a, float t, float time, float b, float c, float lawValue) { return V { a, t, time, b, c, lawValue }; }
+        // The first build's defaults (TARGET -18), kept as fixed test settings so the prototype's figures still reproduce;
+        // the shipped TARGET default is -30 since the stem measurements (L31 checks the shipped table, not this).
         static V defaultsV() { return settings (0.75f, -18.0f, 1.0f, 6.0f, 9.0f, 0.0f); }
         static V cV (float lawValue = 0.0f) { return settings (1.0f, -18.0f, 1.0f, 18.0f, 18.0f, lawValue); }   // C of L.12
 

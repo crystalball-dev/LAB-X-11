@@ -1,7 +1,7 @@
 # LAB X-11
 
 One vocal effect for an FL Studio mixer track, built as a VST® 3 plugin for Windows: a **lookahead noise gate** that
-takes the room tone out between phrases while breaths and word tails pass, followed by a **level matcher** that holds
+takes the room tone out between phrases while word tails and loud breaths pass, followed by a **level matcher** that holds
 each phrase near the level the song needs, the fader ride the vocal otherwise gets by hand. The sixth LAB X- release
 from OPERATION FAIRWAY, built on the [LAB X-16](https://github.com/crystalball-dev/lab-x-16) effect base, in the Deep
 Zone (Oxide) look of the family.
@@ -11,8 +11,9 @@ Zone (Oxide) look of the family.
 LAB X-11 is a fan project. It is not affiliated with or endorsed by GSC Game World. This repository contains no game
 audio and no samples; every test signal is synthesized.
 
-**Status:** version 0.1.0 is built and passes its full test suite on a Linux build (see `docs/DESIGN.md`). The
-FL Studio checks on Windows, the stem-based defaults and the user's listening round are still to come.
+**Status:** version 0.1.0 builds and passes its full test suite on Windows (MSVC) and on Linux, and its defaults were
+checked on the reference vocal takes (see `docs/DESIGN.md`). The FL Studio checks and the user's listening round are
+still to come.
 
 ## What it does
 
@@ -27,6 +28,9 @@ consonant arrives: the opening ramp lands on room tone, never on the word.
   rate in dB, so the close is even, not fast-then-slow.
 - HOLD keeps the gate open after the vocal falls below the close level, counted from the audio itself.
 - RANGE is how far the gate closes. 0 dB leaves the gate open: the LEVEL stage still uses it as its voice detector.
+- Breaths louder than THRESHOLD pass at full level; quieter breath noise between phrases is lowered by RANGE with the
+  room tone. On the reference takes the defaults kept the word tails and the loud breaths and lowered most of the
+  quieter breath noise.
 
 **DETECTOR // ДЕТЕКТОР** shapes what the gate listens to: LOW CUT keeps rumble and plosive thumps out of the decision,
 DETECTOR picks the louder channel's peak or a 2.5 ms RMS, DET RELEASE sets how fast the peak reading falls.
@@ -37,11 +41,17 @@ consonant bursts and hiss-like room tone hold the gain exactly where it is, so n
 
 - AMOUNT scales the whole correction: 100 % lands each phrase on TARGET, 75 % (the default) keeps a quarter of the
   line-to-line contour, 0 % turns the stage off exactly.
-- TARGET is the level, in LUFS, that phrases are moved toward.
-- RIDE is the time constant: the gain moves at most 6 dB per RIDE second.
+- TARGET is the level, in LUFS, that phrases are moved toward (FL's parameter view labels it dB). The default, -30,
+  is the median voiced loudness of the reference lead takes.
+- RIDE is the time constant: the gain moves at most 6 dB per RIDE second of voice. It moves only while the vocal is
+  being measured, so on delivery with many gaps it takes longer by the clock.
 - BOOST and CUT limit the correction (6 and 9 dB by default; boosting is the riskier direction).
+- Lines far quieter than what the matcher has already learned, about 25 dB or more, are not measured, so the gain
+  stays where it was. Put takes recorded at very different levels on their own inserts, or bring them near one level
+  first.
 - LAW: **Ride** moves the gain continuously (every preset uses it). **Step** is the "quantizer" reading: the gain
-  sits on a 1.5 dB grid and moves only in the 5 ms before a phrase starts, like a fader set once per line.
+  sits on a 1.5 dB grid and moves only in the 5 ms before a phrase starts, like a fader set once per line. After 4 s
+  of voice with no gap in the gate it also steps inside the line.
 
 Peak control stays with the compressors after it in the chain: the matcher has no fast path at all.
 
@@ -54,7 +64,9 @@ voice, GAP when the gate is shut); the matcher's LEVEL in LUFS against TARGET; t
 1. Put LAB X-11 in slot 1 of the vocal insert, before EQ and compression.
 2. Play a gap between lines. Raise THRESHOLD until the gate lamp reads CLOSED in the gaps and OPEN on every word. The
    KEY readout shows what the detector hears. Keep THRESHOLD above hum, bleed and room rumble (HVAC, traffic): it is
-   also the matcher's voice detector, and those sounds read as voice to it.
+   also the matcher's voice detector, and those sounds read as voice to it. The defaults assume a vocal recorded at a
+   normal level, peaking around -10 dBFS; a take recorded much lower needs THRESHOLD lowered, or its quieter words are
+   gated.
 3. Play a typical verse and read LEVEL. Set TARGET to it. The average correction is then about 0 dB, so the vocal's
    fader balance against the snare and the drive into the compressors stay as they were; only the line-to-line spread
    shrinks.
@@ -102,7 +114,7 @@ A stage that produces a non-finite sample or a block above +42 dBFS is silenced,
 | `det_mode` | Detector | Peak, RMS | Peak | |
 | `det_release` | Det Release | 1..200 ms | 20 ms | peak detector fall |
 | `level_amount` | Amount | 0..100 % | 75 % | 0 = off, bit-exact |
-| `level_target` | Target | -40..-6 dB | -18 dB | LUFS of the voiced vocal |
+| `level_target` | Target | -40..-6 dB | -30 dB | LUFS of the voiced vocal (FL labels it dB) |
 | `level_time` | Ride Time | 0.5..10 s | 1 s | at most 6 dB per Ride Time second |
 | `level_boost` | Max Boost | 0..18 dB | 6 dB | |
 | `level_cut` | Max Cut | 0..18 dB | 9 dB | |
@@ -130,14 +142,30 @@ Parameter ids and their order never change once the plugin is installed (FL save
   four serial compressors plus volume automation. LAB X-11 replaces the gate and the line-to-line part of that work;
   the compressors keep the peaks.
 - **THRESHOLD -40 dB** is DD Gate's minimum threshold, where all three lead chains run it ("down to -40 dB" in its
-  listing; the normalised setting was read from the project files, the mapping to dB is an assumption). It is
-  provisional until the stems' noise floors are measured.
+  listing; the normalised setting was read from the project files, the mapping to dB is an assumption). Measured on
+  the reference takes (below), it sits well above the room tone and costs no audible vocal on normally recorded takes.
 - **HOLD and RELEASE** follow the reference gates (hold 0 to 0.155 of range, release near minimum), lengthened so word
   tails survive the hysteresis. Their dB and ms mapping in DD Gate is not published; the values are provisional.
-- **TARGET -18 LUFS** is provisional: it becomes the median voiced loudness of the three lead stems once they are
-  measured. The vocal sits at roughly unity against the snare in all three projects (insert faders 87 to 100 %).
+- **TARGET -30 LUFS** is the median voiced loudness of the reference lead takes (below). With TARGET at a take's own
+  level the average correction is about 0 dB. The vocal sits at roughly unity against the snare in all three projects
+  (insert faders 87 to 100 %).
 - The Fruity Compressor settings read from the projects are a tentative decoding and were not used for any default.
 - The gate rows of the presets are provisional for the same reasons.
+
+Measured on the first five minutes of eight raw lead takes from the three projects (44.1 kHz mono, rendered through
+`LabX11Render`; method and per-take figures in `LAB_X11_HANDOFF.md`, section 5.3):
+
+| What | Result |
+|---|---|
+| Room tone between phrases | -70 to -83 dBFS; the gate at its defaults takes it down 14 to 23 dB |
+| Vocal and word-tail energy lost to the gate at its defaults | 0.03 dB or less |
+| Breaths | loud breaths pass untouched; most quieter breath noise is lowered |
+| Voiced loudness of the lines, median per take | -21 to -35 LUFS; about -30 across the eight takes |
+| Line-to-line spread with TARGET at the take's own level | 10 to 30 % smaller on most takes (from none to 55 %) |
+
+The matcher narrows the spread only partly because it cannot hear a line before it plays it: each line starts at the
+previous line's gain (`docs/SPEC_LEVEL_MATCHER.md`, O-9). A ninth take, recorded about 40 dB low, lost most of its
+words at the default THRESHOLD; such a take needs THRESHOLD lowered (step 2 of "Setting it on a vocal").
 
 ## Building on Windows
 
@@ -180,7 +208,15 @@ would list the plugin twice). Rescan in FL's plugin manager; LAB X-11 appears un
   phrase-to-phrase consistency, the gate and matcher together, and a click-free preset switch.
 - **P1**, every preset keeps the reference vocal's loudness within 1 dB.
 
-Real vocals can be rendered with `LabX11Render --in <file.wav> --out <out.wav>`; audio never goes into the repository.
+Real vocals render through the same harness. Pass the file's level, length and sample rate, or the harness scales the
+input by -12 dB and stops after 4 s:
+
+```
+build\LabX11Render_artefacts\Release\LabX11Render.exe --in take.wav --level 0 --seconds 300 --sr 44100 --out take_x11.wav
+```
+
+Add `--program <n>` to load a preset or `--set level_target=-28` to set any parameter. Audio never goes into the
+repository.
 
 ## Licence
 

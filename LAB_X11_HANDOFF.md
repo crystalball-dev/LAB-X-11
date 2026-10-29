@@ -1,12 +1,13 @@
-# LAB X-11 — Plan and execution handoff (DRAFT, awaiting approval)
+# LAB X-11 — Plan and execution handoff
 
-Status: **plan only.** No source, build file or preset has been written in `F:\_DEV\FL PLUGINS\LAB X-11`; the folder
-holds this document alone. Nothing below is implemented until the user approves the plan (section 7 lists the decisions
-that want a yes or a change first). Written 2026-10-18 from a read-only inspection of LAB X-3, X-10, X-16, X-19 (and
-X-0), the three reference FL projects and their stems.
+Status: **executed.** The plan was approved and carried out in a cloud session on branch `claude/task-4jz9sq`
+(2026-10-18/19), then reviewed, measured against the reference takes and re-tested on the Windows machine
+(2026-10-19): see the execution log at the end and `docs/DESIGN.md`. The sections below are the plan as approved;
+where a section was marked PENDING it now says where the answer lives. Written 2026-10-18 from a read-only inspection
+of LAB X-3, X-10, X-16, X-19 (and X-0), the three reference FL projects and their stems.
 
 Naming follows the family: every sibling keeps its plan as `LAB_X<n>_HANDOFF.md` (git-ignored, machine paths allowed),
-so this file is LAB X-11's.
+so this file is LAB X-11's. Unlike the siblings', this one is tracked in its repository.
 
 ---
 
@@ -203,8 +204,9 @@ GmbH" in every README.
 
 ### 1.12 Conventions audit cross-check
 
-[PENDING: the five-project audit workflow (one reader per project, a synthesis, three verifiers) is running; its
-corrections to the table above, if any, land here before approval.]
+Checked 2026-10-19 on the Windows machine: the ported base files are identical to the local LAB X-16 tree apart from
+the renames listed in `docs/DESIGN.md` (M0). The five-project audit produced per-project readings and a synthesis;
+its verification step did not run (session limit).
 
 ---
 
@@ -271,8 +273,8 @@ gate's own state instead of guessing voice activity; the reference chains put th
 (section 5.1) and nothing between gate and compression that LAB X-11 replaces. EQ, saturation, delay and reverb stay in
 the user's later slots, as today.
 
-[PENDING: the exact gate state machine, detector, hysteresis, lookahead length, matcher law and limits come from the
-DSP design panel (three designs, three judges, synthesis, three refuters, fixes); section 3 receives them.]
+Built as specified in `docs/SPEC_LOOKAHEAD_GATE_AND_ALIGNMENT.md` (the gate and its 5 ms lookahead) and
+`docs/SPEC_LEVEL_MATCHER.md` (the matcher, a voice-gated rider); the README's "Signal chain" shows the order as built.
 
 ### 2.3 Latency
 
@@ -300,9 +302,9 @@ Everything the user asked for works on the vocal insert alone. No stage *require
 
 ## 3. Parameters, defaults and ranges
 
-[PENDING: the ParamSpec table (id, name, kind, min, max, default, skewCentre, smooth, unit, choices), the custom meter
-slots and the smoothing choices come from the DSP design panel; provisional defaults marked PROVISIONAL are then set
-from the stem measurements (section 5.3) and the DD Gate settings read from the projects (section 5.2).]
+As built: the ParamSpec rows are in `plugins/x11/LabX11.cpp` and the README's "Parameters" table; the meter slots are
+in `docs/DESIGN.md` (M3). THRESHOLD -40 dB is validated and TARGET -30 is set from the stem measurements (5.3); the
+presets' gate rows stay PROVISIONAL (5.2).
 
 ### 3.6 Real-time safety checklist (applies to every stage above)
 
@@ -328,15 +330,13 @@ matcher's behaviour on synthetic signals, plus one optional real-vocal regressio
 
 ### 4.1 C++ unit tests (`VocalGate::selfTest()`, `LevelMatcher::selfTest()`, printed as `selftest_<case>=<value>`)
 
-[PENDING: the numbered cases, signals, expected results and tolerances from the design panel; every edge of the state
-machine, attack/hold/release timing at 44.1/48/96 kHz and block sizes 1/16/64/512, hysteresis, range depth, no-click on
-close, matcher convergence/accuracy, transient tolerance, freeze in gaps, gate+matcher interaction, denormal and
-non-finite safety, determinism.]
+As built: 179 cases, 33 for the gate and the lookahead and 146 for the matcher and the defaults check, described in
+the specs' test sections (gate spec 8.1, matcher spec L.12) and run by `LabX11Render --selftest` as T0.
 
 ### 4.2 Harness / Python tests
 
-[PENDING: T1-T12 definitions mapped onto `fixture()` signals and `--set` / `--ramp` / `--step` / `--in`; C1-C9 and P1
-notes specific to LAB X-11 (which settings C2 must cover, C6 stage names, C9 panel titles, P1 reference signal).]
+As built: T1-T13 in `test/python/x11_tests.py`, C1-C9 and P1 in `test/run_tests.py`; definitions in the specs (gate
+spec 8.2, matcher spec L.13), results in `docs/DESIGN.md`.
 
 ### 4.3 FL Studio checks (recorded in `docs/DESIGN.md` as X-16 did)
 
@@ -390,12 +390,54 @@ What this says about practice:
 
 ### 5.2 Settings carried into presets
 
-[PENDING: the stem measurements (noise floor, breath level, phrase RMS spread, gap and tail times) from the
-reference-stems workflow; this section then states each preset value and the measurement it rests on.]
+As built (2026-10-19): every preset writes TARGET -30, the median voiced loudness of the measured takes (5.3);
+the first build's -18 was PROVISIONAL. Init's gate (THRESHOLD -40, HYST 4, HOLD 40, RELEASE 120, RANGE 24) is
+validated on those takes: on the eight normally recorded ones it lost 0.03 dB or less of vocal and word-tail
+energy and lowered the room tone by 14 to 23 dB (Appendix B). Rap Lead, Booth Floor and Soft Take's gates were
+measured too (Appendix B); Room Tone (-34) and Ad-lib / Double (-32) were not, and every preset's gate row stays
+PROVISIONAL until the listening round.
 
 ### 5.3 Measured stems
 
-[PENDING: table of the measured values per project, with the method and caveats the analysts reported.]
+Measured 2026-10-19 on the Windows machine, from the first 300 s of each raw lead take (mono, 16-bit, 44.1 kHz;
+`verse take 1.wav`, `vt.wav` and `second half takes.wav` are shorter and were measured whole). Each take was
+rendered through the Windows `LabX11Render` with `--level 0 --seconds <length> --sr 44100` (gate alone =
+`--set level_amount=0`), and the renders were compared with the input in 20 ms frames. The classes are the
+review's own heuristics, not the plugin's internal tests:
+
+- **Room tone**: the 10th percentile of 50 ms RMS frames after an 80 Hz high-pass. **Key in gaps**: the 95th
+  percentile of a peak follower like the gate's detector (80 Hz high-pass, instant attack, 20 ms fall) over frames
+  within 3 dB of the room tone.
+- **Vocal frames**: 150-1000 Hz band at least 6 dB over the 4-8 kHz band, within 30 dB of the take's 95th percentile
+  frame level. **Lines**: vocal frames joined across gaps under 200 ms, at least 0.5 s long, within 20 dB of the
+  90th percentile line. **Line loudness**: BS.1770 K-weighted, both channels summed (the plugin's LEVEL
+  convention, so a mono take reads +3 dB over a mono meter), over the line's vocal frames.
+- **Breath-like frames**: noise-like (high band at or over the low band minus 3 dB), at least 6 dB over the room
+  tone and at least 60 ms from any vocal frame. **Tails**: frames in the 400 ms after each line, within 45 dB of
+  the take's 95th percentile.
+- The scripts lived in the review session's scratchpad (`review_real_vocals.py`, `review_real_vocals2.py`,
+  `review_target_check.py`); no audio was written into the project folders or the repository.
+
+| Project | Take | Peak dBFS | Room tone dBFS | Key in gaps, p95 dB | Breath key, median dB | Voiced line loudness, median LUFS | Line SD dB |
+|---|---|---|---|---|---|---|---|
+| DIEHARD | vocals.wav | -7.5 | -70.0 | -57.5 | -44.7 | -30.1 | 4.11 |
+| DIEHARD | vocal 2.wav | -8.8 | -70.1 | -57.4 | -47.6 | -27.8 | 4.54 |
+| DIEHARD | lyric take clean.wav | -2.6 | -74.2 | -62.8 | -44.3 | -21.3 | 3.77 |
+| SCALES | verse take 1.wav | -5.5 | -78.5 | -67.0 | -62.5 | -35.0 | 5.00 |
+| SCALES | first half  takes.wav | -5.1 | -80.7 | -66.9 | -60.9 | -33.0 | 5.53 |
+| SCALES | second half takes.wav | -8.7 | -83.3 | -69.7 | -62.3 | -26.6 | 5.22 |
+| SCALES | vocals maybe.wav | 0.0 | -74.5 | -62.8 | -55.6 | -33.6 | 7.65 |
+| SCALES | vt.wav | -28.1 | -78.8 | -67.7 | -56.5 | -62.6 | 6.29 |
+| GOLD | vocal1.wav | -9.9 | -72.8 | -56.4 | -46.0 | -29.8 | 2.37 |
+
+Read: the rooms are quiet (room tone -70 to -83 dBFS, the gate key in the gaps at -56 to -70 dB), so THRESHOLD
+-40 dB sits 16 dB or more over the room tone's peaks. The median voiced loudness across the eight normally
+recorded takes is -30 LUFS (-30.1 / -27.8 / -21.3 for DIEHARD, -35.0 / -33.0 / -26.6 / -33.6 for SCALES,
+-29.8 for GOLD; the median of the three project medians is -29.8 as well). `vt.wav` is recorded about 40 dB low
+and is left out of every default. Appendix B has the per-take behaviour of the gate and the matcher.
+
+Not measured: the mixes and instrumentals (vocal-to-instrumental ratio, drum-hit levels), gap and breath
+durations, and the independent re-measurement the plan foresaw.
 
 ### 5.4 Preset list (names are proposals; the user owns naming — D9)
 
@@ -459,17 +501,17 @@ Execution milestones (each ends with the tests named and an execution-log entry)
 | D1 | Code base | Port the X-16 effect base into a standalone LAB X-11 repo (tree in 2.1) | (a) single-plugin `Source/` layout with a new processor; (b) 24th effect inside X-16 | D1 fixes the whole tree; (a) re-implements the guard, fault log, preset fade and dry delay; (b) breaks "self-contained" and the product name |
 | D2 | Zone Bus code | Carried unchanged, `busClient = false`, PEERS panel hidden (zero runtime effect) | strip ZoneBus.h / ZoneBusPlatform.cpp and the ~60 lines that touch them | keeping it means future X-16 base fixes port line for line; stripping it is cleaner but a modified base |
 | D3 | Product identity | `PRODUCT_NAME "LAB X-11"`, `PLUGIN_CODE Lb11`, `BUNDLE_ID com.operationfairway.labx11`, `VST3_CATEGORIES Fx Dynamics`, version 0.1.0 | `Lbx11`-style code; "LAB X-11 <NAME>" with a lore product name as X-16 does | the plugin code and ids cannot change after the first install |
-| D4 | Lookahead / latency | fixed [PENDING ms] at every sample rate, reported; never a run-time parameter | 0 (no latency, consonant onsets clipped by the attack); a choice parameter that requests the base's switch fade | C2 requires constant latency; FL compensates either way |
+| D4 | Lookahead / latency | fixed 5 ms at every sample rate (221 / 240 / 480 samples at 44.1 / 48 / 96 kHz, as built), reported; never a run-time parameter | 0 (no latency, consonant onsets clipped by the attack); a choice parameter that requests the base's switch fade | C2 requires constant latency; FL compensates either way |
 | D5 | Sidechain reference for the matcher | none in 0.1.0; no sidechain bus declared | declare an active-by-default sidechain bus now and add a REFERENCE choice later | buses are append-only once installed (X-16 F4 crash lesson); adding one later changes the plugin's bus layout |
-| D6 | Default gate threshold | measured room-tone floor + margin, never above the measured breath level ([PENDING dBFS]) | the DD Gate setting read from the projects (about -40 dBFS) | too high chops soft consonants and tails; too low lets room tone through (fixable with THRESHOLD) |
-| D7 | Matcher law | [PENDING: continuous slow gain vs stepped "quantized" gain] | the other | the user's word "quantizer" can mean either; the stepped mode is the lab-instrument reading |
-| D8 | Matcher target | a fixed TARGET parameter (dBFS short-term), default [PENDING] | auto-learned from the first N seconds | auto-learn is less predictable in a mix and harder to test |
+| D6 | Default gate threshold | measured room-tone floor + margin, never above the measured breath level (as built: -40 dB, validated on the reference takes, 5.3; loud breaths pass, quieter breath noise is lowered) | the DD Gate setting read from the projects (about -40 dBFS) | too high chops soft consonants and tails; too low lets room tone through (fixable with THRESHOLD) |
+| D7 | Matcher law | as built: continuous Ride by default, stepped Step as a choice (`docs/DESIGN.md`) | the other | the user's word "quantizer" can mean either; the stepped mode is the lab-instrument reading |
+| D8 | Matcher target | a fixed TARGET parameter, default -30 from 5.3 (as built; its unit amended to voiced LUFS, `docs/DESIGN.md`) | auto-learned from the first N seconds | auto-learn is less predictable in a mix and harder to test |
 | D9 | Names and lore | panel titles GATE // ШЛЮЗ, DETECTOR // ДЕТЕКТОР, LEVEL // УРОВЕНЬ; presets as in 5.4; subtitle to be chosen by the user | anything the user prefers | naming is the user's; nothing in the code depends on it |
 | D10 | Unit-test vehicle | `selfTest()` in the DSP headers + harness `--selftest` + Python assertions (the house pattern) | a separate `LabX11Tests` console target (JUCE UnitTest / CTest) | the house pattern needs no new target; a test executable is the more conventional "unit test" shape |
 | D11 | Theme | Oxide (Deep Zone), fixed 960 x 560 | Vacuum (Ethereal Signal); a smaller window for a two-stage effect | the user's visual theme for X-11 decides; both themes exist in the engine |
 
-[PENDING: the DSP design panel's own open decisions (detector type, hysteresis width, range floor, matcher limits,
-transient tolerance) join this table.]
+The DSP specs' own open points are in `docs/SPEC_LOOKAHEAD_GATE_AND_ALIGNMENT.md` section 9 and
+`docs/SPEC_LEVEL_MATCHER.md` L.15; `docs/DESIGN.md` lists the ones waiting on the user.
 
 ---
 
@@ -522,9 +564,63 @@ transient tolerance) join this table.]
 
 ## Appendix B. Stem measurements
 
-[PENDING: the reference-stems workflow's tables (per file: role, sample rate, duration, peak, RMS, loudness, crest,
-short-term percentiles; per raw take: floor, breath level, phrase RMS spread, gap and tail times; per mix: vocal-to-
-instrumental ratio and drum-hit levels) and the independent re-measurement verdicts.]
+Method in 5.3. The gate at its defaults, the matcher off:
+
+| Take | Room tone change dB | Vocal energy change dB | Tail energy change dB | Vocal frames cut > 3 dB % | Breath-like frames cut > 6 dB % | Breath energy change dB |
+|---|---|---|---|---|---|---|
+| vocals.wav | -16.6 | -0.00 | -0.01 | 2.5 | 55.3 | -0.02 |
+| vocal 2.wav | -16.5 | -0.00 | -0.01 | 1.4 | 67.5 | -0.02 |
+| lyric take clean.wav | -23.4 | -0.00 | -0.00 | 1.5 | 52.7 | -0.00 |
+| verse take 1.wav | -22.9 | -0.00 | -0.01 | 2.0 | 63.9 | -0.01 |
+| first half  takes.wav | -19.3 | -0.01 | -0.01 | 9.1 | 92.4 | -0.03 |
+| second half takes.wav | -18.9 | -0.00 | -0.02 | 2.1 | 93.4 | -0.08 |
+| vocals maybe.wav | -14.4 | -0.00 | -0.01 | 6.4 | 77.4 | -0.02 |
+| vt.wav | -21.3 | -6.63 | -0.87 | 94.5 | 79.5 | -0.66 |
+| vocal1.wav | -14.2 | -0.00 | -0.03 | 1.1 | 64.8 | -0.08 |
+
+Loud breaths open the gate and pass (breath energy changes by about 0 dB), while most of the quieter breath-like
+frames are cut by more than 6 dB. `vt.wav` loses most of its vocal frames at THRESHOLD -40.
+
+The preset gates, the matcher off: share of vocal frames cut by more than 3 dB (THRESHOLD in brackets):
+
+| Take | Init (-40) | Rap Lead (-38) | Booth Floor (-42) | Soft Take (-48, RANGE 12) |
+|---|---|---|---|---|
+| vocals.wav | 2.5 | 3.8 | 1.6 | 0.7 |
+| vocal 2.wav | 1.4 | 2.7 | 0.8 | 0.1 |
+| lyric take clean.wav | 1.5 | 2.3 | 1.2 | 0.8 |
+| verse take 1.wav | 2.0 | 3.9 | 0.8 | 0.4 |
+| first half  takes.wav | 9.1 | 12.0 | 5.5 | 2.7 |
+| second half takes.wav | 2.1 | 3.8 | 1.1 | 0.4 |
+| vocals maybe.wav | 6.4 | 10.1 | 3.8 | 1.3 |
+| vt.wav | 94.5 | 98.9 | 84.7 | 58.8 |
+| vocal1.wav | 1.1 | 1.8 | 0.7 | 0.1 |
+
+The matcher, line-loudness standard deviation in dB and the median gain per line in dB (Init, AMOUNT 0.75):
+
+| Take | Line SD, gate only | Init at TARGET -18: SD / median gain | Init at the take's own median: SD | Init at TARGET -30 (shipped): SD / median gain | Rap Lead at -30: SD |
+|---|---|---|---|---|---|
+| vocals.wav | 4.11 | 4.55 / 4.5 | 3.64 | 3.64 / 0.1 | 3.49 |
+| vocal 2.wav | 4.54 | 4.49 / 4.5 | 4.02 | 4.02 / -1.6 | 3.80 |
+| lyric take clean.wav | 3.77 | 3.40 / 2.9 | 3.10 | 3.11 / -5.3 | 3.08 |
+| verse take 1.wav | 5.00 | 5.03 / 4.4 | 2.24 | 2.57 / 3.3 | 2.43 |
+| first half  takes.wav | 5.53 | 5.43 / 4.5 | 4.38 | 4.41 / 1.5 | 4.39 |
+| second half takes.wav | 5.22 | 5.56 / 4.4 | 5.24 | 5.16 / -2.1 | 4.13 |
+| vocals maybe.wav | 7.65 | 7.11 / 4.5 | 6.11 | 6.01 / 1.8 | 6.11 |
+| vt.wav | 6.29 | 6.36 / 0.0 | 6.20 | not run | not run |
+| vocal1.wav | 2.37 | 2.42 / 4.5 | 1.66 | 1.66 / -0.7 | 1.60 |
+
+At TARGET -18 the matcher sat at MAX BOOST on the takes at -28 to -35 LUFS: a flat +4.5 dB and no evening. At
+-30 its median gain is near 0 dB on takes near -30 and the line SD falls 1 to 49 %, 11 to 30 % on most takes;
+a causal rider cannot do much more (`docs/SPEC_LEVEL_MATCHER.md`, O-9).
+
+The misset-gate case after the TARGET change (spec M12), matcher gain in dB:
+
+| Case (3 s of hum at -54.7 LUFS, then the first 20 s of vocal1.wav) | Gain at the end of the hum, dB | First 2 s after the hum, median dB | 12-20 s after the hum, median dB |
+|---|---|---|---|
+| THRESHOLD -80 (misset), TARGET -18 | 0.0 | 0.0 | 4.1 |
+| THRESHOLD -80 (misset), TARGET -30 | 4.1 | 4.2 | 1.1 |
+| no hum (3 s of silence), THRESHOLD -80, TARGET -30 | no signal | 0.0 | 0.5 |
+| THRESHOLD -40 (default), TARGET -30 | gate closed on the hum | gate closed | 0.3 |
 
 ## Execution log
 
@@ -549,3 +645,18 @@ base cloned read-only from github.com/crystalball-dev/lab-x-16. `docs/DESIGN.md`
 - **Verification.** `run_tests.py --all`: 24 of 24 (C1-C9 with pluginval 5 and 10, T0-T13 with 179 self-tests, P1).
 - **Still open:** section 5.2 / 5.3 / Appendix B stem measurements (THRESHOLD and TARGET defaults stay PROVISIONAL);
   the FL checks F-A to F-E on Windows; decisions D7 and D8 (as built, see `docs/DESIGN.md`) and D9 naming for the user.
+
+Reviewed, measured and re-tested on the Windows machine (2026-10-19, a local session):
+
+- **Windows build.** `scripts/build.ps1` (VS 2022 Build Tools with MSVC 14.44, CMake 4.4.4, JUCE 9.0.3): clean, no
+  warnings. `--selftest` 179 of 179 and `run_tests.py --all` 24 of 24 with pluginval 5 and 10, on the branch as pushed
+  and again after the changes below.
+- **Port check.** The ported base files equal the local LAB X-16 tree apart from the documented renames.
+- **Stem measurements** (5.3, Appendix B). THRESHOLD -40 is validated. TARGET's default changed from -18 to -30 in the
+  parameter table, `LevelMatcher::defaults` and every preset; T11's Rap Lead render and T12(g) now place their signals
+  relative to the preset TARGET. Spec M12 records it, with its one cost: a misset gate lets hum before the first line
+  form the first level at Init.
+- **README.** The real-vocal render command passes `--level 0 --seconds --sr`; the voiced-time ride, the level guard,
+  Step's in-line commit, the dB label, the breath behaviour and quiet takes are documented; a measurement table added.
+- **Still open:** the FL checks F-A to F-E; decisions D7, D8 and D9; and three from the review in `docs/DESIGN.md`:
+  breaths, the pre-level floor at -30, and a lookahead mode for the matcher.
